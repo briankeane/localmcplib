@@ -1,0 +1,22 @@
+schema_version = 1
+
+[observability]
+log_level = "WARNING"
+
+[llm]
+backend = "openai_compatible"
+base_url = "https://gateway.example.test/v1"
+
+[secrets.llm_api_key]
+env_vars = ["EXAMPLE_LLM_API_KEY"]
+
+[server.server-a.llm]
+backend = "openai_compatible"
+
+[server.server-a.secrets.llm_api_key]
+env_vars = ["SERVER_A_LLM_API_KEY"]
+
+# For a native-provider deployment, set [llm].backend = "native", remove its
+# base_url, and declare openai_api_key / anthropic_api_key with the matching
+# provider environment variables. Application-owned model-role IDs stay the
+# same in both deployments.
