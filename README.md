@@ -11,11 +11,12 @@ The published distribution is `localmcplib`; the Python import package is
 ## Introduction
 
 A local MCP server can start as a few tool functions, but production use adds a
-surprising amount of non-domain work: stdout and stderr must remain clean for
-JSON-RPC, credentials need safe lookup boundaries, configuration must compose
-across servers, model connections need deployment-independent routing, and
-long-running operations need lifecycle and recovery support. Model-controlled
-local commands also need an actual security boundary.
+surprising amount of non-domain work: stdout must remain clean for JSON-RPC,
+stderr should carry useful startup diagnostics, credentials need safe lookup
+boundaries, configuration must compose across servers, model connections need
+deployment-independent routing, and long-running operations need lifecycle and
+recovery support. Model-controlled local commands also need an actual security
+boundary.
 
 `localmcplib` owns these reusable mechanics while consuming servers continue
 to own their schemas, tools, service clients, prompts, and authorization
@@ -95,9 +96,10 @@ serves it over stdio without writing logs to the protocol streams.
 `localmcp.STDIOServer` assembles a FastMCP application from a server name, tool
 list, and runtime factory. It owns startup and shutdown ordering, shared config
 validation, secrets, model and telemetry wiring, per-server state paths,
-file-only logging, and silent failure handling for stdout/stderr-safe operation.
-Applications with additional configuration fields may supply an optional typed
-`config_parser`; its result is passed to the runtime factory and lifespan.
+file-only logging, and config error messages on stderr while keeping stdout
+clear for the MCP protocol. Applications with additional configuration fields
+may supply an optional typed `config_parser`; its result is passed to the
+runtime factory and lifespan.
 
 ### Shared configuration and paths
 

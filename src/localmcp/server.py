@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -216,6 +217,9 @@ class STDIOServer[ConfigT, RuntimeT: RuntimeLifecycle]:
             )
             log_file = LocalMCPPaths.from_environment(env, home=home).server_log_file(self.name)
             configure_logging(log_file=log_file, level=level)
+        except ConfigError as exc:
+            print(f"{self.name}: configuration error: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
         except Exception as exc:
             raise SystemExit(1) from exc
 
