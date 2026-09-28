@@ -12,7 +12,7 @@ from fastmcp.tools import tool
 
 import localmcp
 import localmcp.server as server_module
-from localmcp.config import ServerConfig
+from localmcp.config import ConfigError, ServerConfig
 from localmcp.llm import ConfiguredModelFactory, ModelFactory
 from localmcp.observability.telemetry import LangfuseTelemetry
 from localmcp.server import RuntimeUnavailableError, current_runtime, main
@@ -302,6 +302,52 @@ def test_run_converts_serve_failure_to_silent_system_exit(
     captured = capfd.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("config_text", "parser_error", "message"),
+    [
+        ("[llm]\nbackend = 'other'", None, "unsupported llm.backend: 'other'"),
+        (
+            "[llm]\nbackend = 'native'",
+            "pr_review.allowed_hosts: extra inputs are not permitted",
+            "pr_review.allowed_hosts: extra inputs are not permitted",
+        ),
+    ],
+)
+def test_run_reports_config_error_to_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    config_text: str,
+    parser_error: str | None,
+    message: str,
+) -> None:
+    config_home = tmp_path / "config"
+    path = config_home / "localmcp/localmcp.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text(config_text)
+    env = {"XDG_CONFIG_HOME": str(config_home)}
+    monkeypatch.setattr("localmcp.server.os.environ", env)
+    monkeypatch.setattr("localmcp.server.Path.home", lambda: tmp_path)
+    server = _server()
+    if parser_error is not None:
+
+        def reject_config(_config: ServerConfig) -> _Config:
+            raise ConfigError(parser_error)
+
+        server.config_parser = reject_config
+    calls: list[None] = []
+    monkeypatch.setattr(server.mcp, "run", lambda **_kwargs: calls.append(None))
+
+    with pytest.raises(SystemExit) as exc_info:
+        server.run()
+
+    assert exc_info.value.code == 1
+    assert calls == []
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == f"example-mcp: configuration error: {message}\n"
 
 
 @pytest.mark.parametrize(
