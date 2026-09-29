@@ -15,7 +15,7 @@ from localmcp.sandbox import (
     SandboxRoot,
     seatbelt,
 )
-from localmcp.sandbox.seatbelt import MacOSSandbox, _resolve_git
+from localmcp.sandbox.seatbelt import MacOSSandbox, _resolve_utility
 
 
 class _Process:
@@ -348,6 +348,7 @@ async def _prepare_execute(
     sandbox._sandbox_exec = sandbox_exec
     sandbox._runtime_paths = (tmp_path / "runtime",)
     sandbox._runtime_directories = (tmp_path / "runtime-dir",)
+    sandbox._helper_directories = ()
     sandbox._metadata_ancestors = (tmp_path.parent,)
     process = _Process(returncode=returncode)
     captured: dict[str, Any] = {}
@@ -541,9 +542,37 @@ async def test_sandbox_tool_reports_budget_success_and_failure(monkeypatch: pyte
     }
 
 
+def test_resolve_utility_prefers_a_non_shim_path_without_probing_xcrun(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A real binary on PATH (e.g. Homebrew) is used as-is; xcrun must not be consulted.
+    _resolve_utility.cache_clear()
+    real = Path("/opt/homebrew/bin/git")
+    monkeypatch.setattr(seatbelt.shutil, "which", lambda name: str(real))
+    monkeypatch.setattr(seatbelt, "_resolve_executable", lambda candidate: Path(candidate) if candidate else None)
+
+    def fail_xcrun(name: str) -> Path | None:
+        raise AssertionError("xcrun should not be probed when PATH holds a real binary")
+
+    monkeypatch.setattr(seatbelt, "_resolve_via_xcrun", fail_xcrun)
+    assert _resolve_utility("git") == real
+    _resolve_utility.cache_clear()
+
+
+def test_resolve_utility_returns_none_when_only_the_shim_exists_and_toolchain_is_broken(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PATH yields only the /usr/bin shim and developer-dir discovery fails: advertise nothing
+    # rather than a git that cannot run under the sandbox.
+    _resolve_utility.cache_clear()
+    monkeypatch.setattr(seatbelt.shutil, "which", lambda name: "/usr/bin/git")
+    monkeypatch.setattr(seatbelt, "_resolve_executable", lambda candidate: Path(candidate) if candidate else None)
+    monkeypatch.setattr(seatbelt, "_resolve_via_xcrun", lambda name: None)
+    assert _resolve_utility("git") is None
+    _resolve_utility.cache_clear()
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="the /usr/bin/git shim is macOS-only")
 def test_resolved_git_is_not_the_xcode_shim() -> None:
-    git = _resolve_git()
+    git = _resolve_utility("git")
     if git is None:
         pytest.skip("no git toolchain available on this machine")
 
@@ -553,23 +582,27 @@ def test_resolved_git_is_not_the_xcode_shim() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="libexec/git-core layout is macOS-only")
-def test_git_core_helpers_are_included_in_runtime_reads(tmp_path: Path) -> None:
-    if _resolve_git() is None:
+def test_git_core_helpers_are_granted_read_and_exec(tmp_path: Path) -> None:
+    if _resolve_utility("git") is None:
         pytest.skip("no git toolchain available on this machine")
 
     sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path),)))
 
-    git_core_dirs = [path for path in sandbox._runtime_directories if path.name == "git-core"]
+    git_core_dirs = [path for path in sandbox._helper_directories if path.name == "git-core"]
     assert git_core_dirs, "libexec/git-core helpers directory must be granted to the sandbox"
     for directory in git_core_dirs:
         assert directory.is_dir()
         assert any(directory.iterdir())
 
+    # git re-execs its subcommand helpers, so the grant must include exec-mapping, not just read.
+    profile = sandbox._compiled_profile()
+    assert 'file-map-executable (subpath (param "HELPER_DIRECTORY_0"))' in profile
+
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
 @pytest.mark.asyncio
 async def test_git_runs_inside_a_read_only_sandbox(tmp_path: Path) -> None:
-    if _resolve_git() is None or not Path("/usr/bin/sandbox-exec").is_file():
+    if _resolve_utility("git") is None or not Path("/usr/bin/sandbox-exec").is_file():
         pytest.skip("no git toolchain or sandbox-exec available on this machine")
 
     sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path, RootAccess.READ_ONLY),)))
@@ -577,14 +610,19 @@ async def test_git_runs_inside_a_read_only_sandbox(tmp_path: Path) -> None:
     # Build the repo with the resolved git and the sandbox's own sanitized env so the
     # fixture is hermetic: no inherited global config/hooks/GIT_CONFIG_* (e.g. a host
     # commit.gpgsign=true) can make setup fail before the sandbox assertions run.
-    git = str(_resolve_git())
+    git = str(_resolve_utility("git"))
     env = sandbox._environment()
     (tmp_path / "file.txt").write_text("first\nsecond\n")
     commit = (git, "-c", "user.email=t@e.st", "-c", "user.name=Tester")
     for argv in ((git, "init", "-q"), (git, "add", "file.txt"), (*commit, "commit", "-qm", "seed")):
         subprocess.run(argv, cwd=tmp_path, check=True, env=env)
 
-    for command in ("git log --oneline", "git show HEAD", "git blame file.txt"):
-        result = await sandbox.run(command)
-        assert result.exit_code == 0, f"{command!r} failed: {result.stderr}"
-        assert result.stderr.strip() == ""
+    # git can legitimately write advice/hints to stderr while exiting 0, so assert on the
+    # exit code and the expected stdout rather than on empty stderr.
+    result = await sandbox.run("git log --oneline")
+    assert result.exit_code == 0, f"git log failed: {result.stderr}"
+    assert "seed" in result.stdout
+
+    result = await sandbox.run("git blame file.txt")
+    assert result.exit_code == 0, f"git blame failed: {result.stderr}"
+    assert "first" in result.stdout and "second" in result.stdout

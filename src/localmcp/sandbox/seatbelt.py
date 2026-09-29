@@ -9,6 +9,7 @@ import shutil
 import signal
 import subprocess
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol
@@ -135,7 +136,24 @@ def _runtime_read_directories(paths: tuple[Path, ...]) -> tuple[Path, ...]:
     return tuple(sorted(directories, key=os.fspath))
 
 
-_XCODE_SHIM = Path("/usr/bin/git")
+@dataclass(frozen=True)
+class _Utility:
+    """A command the sandbox exposes, plus where it dispatches its exec helpers.
+
+    ``helper_subdir`` is the tool's helper directory relative to ``<bindir>/..`` (git
+    re-execs subcommands from ``libexec/git-core``); it is empty for tools with none.
+    """
+
+    name: str
+    helper_subdir: tuple[str, ...] = ()
+
+
+# Utilities exposed inside the sandbox. Adding one is a data row, not new code: resolution
+# (including bypassing any /usr/bin libxcselect shim) and helper-dir wiring are generic below.
+_UTILITIES: tuple[_Utility, ...] = (
+    _Utility("rg"),
+    _Utility("git", helper_subdir=("libexec", "git-core")),
+)
 
 
 def _resolve_executable(candidate: str | os.PathLike[str] | None) -> Path | None:
@@ -148,20 +166,10 @@ def _resolve_executable(candidate: str | os.PathLike[str] | None) -> Path | None
     return resolved if resolved.is_file() else None
 
 
-def _resolve_git() -> Path | None:
-    """Resolve a real git binary, bypassing the ``/usr/bin/git`` libxcselect shim.
-
-    ``/usr/bin/git`` is not git: it reads ``/var/db/xcode_select_link`` and re-execs
-    the toolchain git under the developer dir. Both reads sit outside the default-deny
-    sandbox, so the shim (and every subcommand) fails. A ``git`` on PATH somewhere other
-    than that shim (e.g. Homebrew) is a real binary and is used unchanged; otherwise the
-    real binary is located from the active developer directory via ``xcrun``/``xcode-select``.
-    """
-    which_git = _resolve_executable(shutil.which("git"))
-    if which_git is not None and which_git != _XCODE_SHIM:
-        return which_git
-
-    for argv in (["/usr/bin/xcrun", "-f", "git"], ["/usr/bin/xcode-select", "-p"]):
+def _resolve_via_xcrun(name: str) -> Path | None:
+    """Locate ``name`` in the active developer directory, past the ``/usr/bin`` shim."""
+    shim = Path("/usr/bin") / name
+    for argv in (["/usr/bin/xcrun", "-f", name], ["/usr/bin/xcode-select", "-p"]):
         try:
             result = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=5)
         except (OSError, subprocess.SubprocessError):
@@ -171,20 +179,37 @@ def _resolve_git() -> Path | None:
         value = result.stdout.strip()
         if not value:
             continue
-        candidate = value if argv[1] == "-f" else os.path.join(value, "usr", "bin", "git")
+        candidate = value if argv[1] == "-f" else os.path.join(value, "usr", "bin", name)
         real = _resolve_executable(candidate)
-        if real is not None and real != _XCODE_SHIM:
+        if real is not None and real != shim:
             return real
-
-    # Nothing better than the shim (or no git at all): expose whatever exists.
-    return which_git or _resolve_executable(_XCODE_SHIM)
+    return None
 
 
-def _git_core_directories(git: Path | None) -> tuple[Path, ...]:
-    """Locate the sibling ``libexec/git-core`` helpers dir git dispatches subcommands through."""
-    if git is None:
+@lru_cache(maxsize=8)
+def _resolve_utility(name: str) -> Path | None:
+    """Resolve a real binary for ``name``, bypassing the ``/usr/bin`` libxcselect shim.
+
+    ``/usr/bin/git`` (and its siblings) are not the tools: each reads
+    ``/var/db/xcode_select_link`` and re-execs the toolchain binary under the developer dir.
+    Both reads sit outside the default-deny sandbox, so the shim and every subcommand fail. A
+    copy on PATH elsewhere (e.g. Homebrew) is real and used unchanged; otherwise the binary is
+    located from the active developer directory via ``xcrun``/``xcode-select``. Returns ``None``
+    when only the unusable shim exists, so a tool that cannot run is never advertised. Memoized:
+    a process's toolchain does not change, and probing an unhealthy selection can cost seconds.
+    """
+    shim = Path("/usr/bin") / name
+    which = _resolve_executable(shutil.which(name))
+    if which is not None and which != shim:
+        return which
+    return _resolve_via_xcrun(name)
+
+
+def _helper_directories(executable: Path | None, helper_subdir: tuple[str, ...]) -> tuple[Path, ...]:
+    """Locate a tool's exec-helper directory (e.g. git's ``libexec/git-core``)."""
+    if executable is None or not helper_subdir:
         return ()
-    candidate = git.parent.parent / "libexec" / "git-core"
+    candidate = executable.parent.parent.joinpath(*helper_subdir)
     try:
         resolved = candidate.resolve(strict=True)
     except OSError:
@@ -263,24 +288,34 @@ class MacOSSandbox:
         self.process_label = process_label
         self._sandbox_exec = Path("/usr/bin/sandbox-exec")
         self._shell = Path("/bin/sh")
-        git = _resolve_git()
-        rg = _resolve_executable(shutil.which("rg"))
-        self._executables = tuple(executable for executable in (rg, git) if executable is not None)
+        resolved = [
+            (utility, binary) for utility in _UTILITIES if (binary := _resolve_utility(utility.name)) is not None
+        ]
+        self._executables = tuple(binary for _, binary in resolved)
         self._runtime_paths = tuple(
             sorted(
                 {path for executable in self._executables for path in _runtime_read_paths(executable)}, key=os.fspath
             )
         )
-        # git dispatches most subcommands through helpers under libexec/git-core; grant it read.
-        self._git_core_directories = _git_core_directories(git)
-        self._runtime_directories = tuple(
-            sorted(set(_runtime_read_directories(self._runtime_paths)) | set(self._git_core_directories), key=os.fspath)
+        # Tools like git dispatch subcommands by exec'ing helpers under a sibling directory
+        # (git: libexec/git-core); those need read + exec-map, granted separately from the
+        # runtime dylib directories below.
+        self._helper_directories = tuple(
+            sorted(
+                {
+                    directory
+                    for utility, binary in resolved
+                    for directory in _helper_directories(binary, utility.helper_subdir)
+                },
+                key=os.fspath,
+            )
         )
+        self._runtime_directories = _runtime_read_directories(self._runtime_paths)
         self._process_limit = _owned_process_limit()
         # Grant metadata reads along the resolved toolchain paths so deep developer-dir
         # installs (e.g. inside Xcode.app) stay traversable without opening whole trees.
         self._metadata_ancestors = _path_ancestors(
-            tuple(root.path for root in self.roots) + self._executables + self._git_core_directories
+            tuple(root.path for root in self.roots) + self._executables + self._helper_directories
         )
 
     async def run(self, command: str) -> CommandResult:
@@ -315,6 +350,11 @@ class MacOSSandbox:
             value
             for index, path in enumerate(self._runtime_directories)
             for value in ("-D", f"RUNTIME_DIRECTORY_{index}={path}")
+        )
+        runtime_definitions.extend(
+            value
+            for index, path in enumerate(self._helper_directories)
+            for value in ("-D", f"HELPER_DIRECTORY_{index}={path}")
         )
         runtime_definitions.extend(
             value
@@ -394,6 +434,12 @@ class MacOSSandbox:
         runtime_profile += "".join(
             f'(allow file-read* (subpath (param "RUNTIME_DIRECTORY_{index}")))\n'
             for index in range(len(self._runtime_directories))
+        )
+        # Helper directories hold binaries the tool re-execs (git's git-core), so they need
+        # exec-mapping too — a plain read grant would let git start but deny dispatched helpers.
+        runtime_profile += "".join(
+            f'(allow file-read* file-map-executable (subpath (param "HELPER_DIRECTORY_{index}")))\n'
+            for index in range(len(self._helper_directories))
         )
         runtime_profile += "".join(
             f'(allow file-read-metadata (literal (param "METADATA_ANCESTOR_{index}")))\n'
