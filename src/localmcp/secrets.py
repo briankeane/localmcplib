@@ -167,11 +167,9 @@ class SecretResolver:
         getter = self._keyring_getter
         keyring_error: type[BaseException]
         if getter is None:
-            try:
-                import keyring
-                import keyring.errors
-            except ImportError as exc:
-                raise SecretBackendError("keyring backend requested; install localmcplib[secrets]") from exc
+            import keyring
+            import keyring.errors
+
             getter = keyring.get_password
             keyring_error = keyring.errors.KeyringError
         else:

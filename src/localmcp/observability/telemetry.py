@@ -173,7 +173,7 @@ class LangfuseTelemetry:
                 "dependency_missing",
                 True,
                 reported_base_url,
-                "Install the optional dependency with localmcplib[telemetry].",
+                "The langfuse package could not be imported.",
             )
             log.warning("langfuse.dependency_missing")
             return

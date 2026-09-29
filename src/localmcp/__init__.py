@@ -1,7 +1,7 @@
 """Reusable foundations for local MCP servers.
 
-Optional capabilities are resolved lazily so importing :mod:`localmcp` alone
-does not require an LLM, MCP, telemetry, or workflow stack.
+The server composition is resolved lazily so importing :mod:`localmcp` alone
+does not load the LLM, MCP, telemetry, or workflow stack.
 """
 
 from __future__ import annotations

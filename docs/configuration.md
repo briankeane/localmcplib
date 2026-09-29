@@ -74,6 +74,37 @@ stable `ModelFactory.create(model_id, ...)` boundary over both modes. Models
 and transports are created lazily for each call and are closed by the returned
 async context manager.
 
+### Model catalog
+
+The built-in model catalog is advisory. Any model ID is accepted and sent to
+the provider, which remains the authority on whether it exists; an unknown or
+misspelled ID fails with the provider's own error. IDs outside the catalog use
+inferred capabilities and log one warning:
+
+- temperature is omitted;
+- `claude-*` IDs use the Anthropic dialect and native provider;
+- `gpt-*` and `o<digit>*` IDs use the OpenAI dialect and native provider;
+- all other IDs use the OpenAI dialect and are gateway-only; and
+- OpenAI-dialect models pass a caller-requested reasoning effort through.
+
+`[llm.models."<model-id>"]` declares or corrects a model without a library
+release. Each entry updates only the fields it names, starting from the
+catalogued spec or, for an unlisted ID, the inferred one:
+
+```toml
+[llm.models."claude-opus-5-5"]
+temperature = "omit"
+
+[llm.models."house-model"]
+dialect = "anthropic"
+```
+
+Supported fields are `temperature` (`"zero"` or `"omit"`),
+`supports_reasoning_effort`, `default_reasoning_effort`, `native_provider`, and
+`dialect` (`"anthropic"` or `"openai"`). Moving a model to the Anthropic
+dialect disables an inherited reasoning-effort capability unless
+`supports_reasoning_effort` is set explicitly.
+
 Server authors may select a different document at the loading boundary. This
 defines which configuration and secret declarations are visible to that
 runtime. Secret keyring boundaries are derived from logical server names, not

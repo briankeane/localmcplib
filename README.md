@@ -24,10 +24,10 @@ policy.
 
 ## Quickstart
 
-Install the integrated server capability:
+Install the package:
 
 ```console
-uv add 'localmcplib[server]'
+uv add localmcplib
 ```
 
 The following complete `hello.py` registers one tool and runs it as a FastMCP
@@ -127,6 +127,11 @@ Anthropic credentials. Gateway protocol dialect and native provider are
 separate model properties, so switching deployment does not require changing
 application model roles.
 
+Gateways do not always forward native structured-output constraints to the
+provider. `localmcp.structured_output.FencedJSONOutputMiddleware` lets a
+`ProviderStrategy` agent accept a response wrapped in one Markdown JSON fence,
+still validated against the same schema.
+
 ### Sandboxing
 
 The sandbox API provides bounded command execution with explicit filesystem
@@ -150,27 +155,6 @@ default. Set `LOCALMCP_LANGFUSE_CAPTURE_PAYLOADS=true` to capture model prompts,
 model responses, tool arguments, and tool results. This opt-in can send secrets,
 repository content, and other sensitive data to Langfuse; enable it only when
 the configured Langfuse project is an approved destination for those payloads.
-
-## Capability extras
-
-Install only what an application uses:
-
-| Extra | Capability |
-| --- | --- |
-| `server` | Integrated FastMCP stdio application composition |
-| `secrets` | OS-keyring secret resolution |
-| `llm` | OpenAI-compatible and native OpenAI/Anthropic models |
-| `sandbox` | Portable sandbox API and macOS Seatbelt implementation |
-| `observability` | Structured file logging |
-| `telemetry` | Langfuse and FastMCP telemetry integration |
-| `workflows` | Durable LangGraph and SQLite workflow foundations |
-| `all` | Every optional capability |
-
-For example:
-
-```console
-uv add 'localmcplib[server,sandbox,workflows]'
-```
 
 ## Status
 

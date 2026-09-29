@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+import logging
+import re
 import ssl
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -14,9 +16,12 @@ NativeProvider = Literal["anthropic", "openai"]
 ModelDialect = Literal["anthropic", "openai"]
 LLMBackend = Literal["openai_compatible", "native"]
 
+_log = logging.getLogger(__name__)
+_warned_unregistered: set[str] = set()
+
 
 class ModelConfigurationError(ValueError):
-    """Raised for unknown models or invalid model/backend settings."""
+    """Raised for invalid model specs or model/backend settings."""
 
 
 @dataclass(frozen=True)
@@ -47,8 +52,30 @@ class ModelSpec:
         return self.dialect or self.native_provider or "openai"
 
 
+def infer_model_spec(model_id: str) -> ModelSpec:
+    """Return conservative capabilities for a model the catalog does not know.
+
+    The catalog is advisory: an unregistered ID is passed through to the
+    provider, which remains the authority on whether it exists. Temperature is
+    omitted because newer models increasingly reject it, and the provider is
+    inferred from well-known ID prefixes. OpenAI-dialect models pass a
+    caller-requested reasoning effort through for the provider to accept or
+    reject.
+    """
+    normalized = model_id.lower()
+    if normalized.startswith("claude-"):
+        return ModelSpec(temperature="omit", native_provider="anthropic")
+    if normalized.startswith("gpt-") or re.match(r"o\d", normalized):
+        return ModelSpec(temperature="omit", supports_reasoning_effort=True, native_provider="openai")
+    return ModelSpec(temperature="omit", supports_reasoning_effort=True)
+
+
 class ModelRegistry:
-    """Immutable model catalog with explicit application overlays."""
+    """Immutable, advisory model catalog with explicit application overlays.
+
+    Registered specs describe known capabilities. Unregistered IDs resolve to
+    :func:`infer_model_spec` so new models work without a library release.
+    """
 
     def __init__(self, models: Mapping[str, ModelSpec] | None = None):
         self._models = dict(models or {})
@@ -56,10 +83,15 @@ class ModelRegistry:
             raise ModelConfigurationError("model IDs must not be blank")
 
     def resolve(self, model_id: str) -> ModelSpec:
-        try:
-            return self._models[model_id]
-        except KeyError as exc:
-            raise ModelConfigurationError(f'unknown model id "{model_id}"') from exc
+        if not model_id.strip():
+            raise ModelConfigurationError("model IDs must not be blank")
+        spec = self._models.get(model_id)
+        if spec is None:
+            if model_id not in _warned_unregistered:
+                _warned_unregistered.add(model_id)
+                _log.warning('model "%s" is not in the catalog; using inferred capabilities', model_id)
+            return infer_model_spec(model_id)
+        return spec
 
     def overlay(self, models: Mapping[str, ModelSpec]) -> ModelRegistry:
         return ModelRegistry({**self._models, **models})
@@ -68,8 +100,9 @@ class ModelRegistry:
         return dict(self._models)
 
 
-# Conservative cross-gateway capabilities. Applications may overlay this
-# catalog when an endpoint has stricter or newer behavior. Invocation policy
+# Conservative cross-gateway capabilities. Applications and localmcp.toml
+# [llm.models] may overlay this catalog when an endpoint has stricter or newer
+# behavior; unlisted IDs fall back to infer_model_spec. Invocation policy
 # such as the chosen reasoning effort intentionally remains caller-owned.
 DEFAULT_MODEL_SPECS: Mapping[str, ModelSpec] = {
     "claude-opus-5": ModelSpec(native_provider="anthropic"),
@@ -204,10 +237,8 @@ class ModelFactory(Protocol):
 
 
 def _httpx2_client(*, verify: bool | str | ssl.SSLContext, keepalive_expiry: float) -> AsyncHTTPClient:
-    try:
-        import httpx2
-    except ImportError as exc:  # pragma: no cover - dependency error path
-        raise ModelConfigurationError("model support requires localmcplib[llm]") from exc
+    import httpx2
+
     return httpx2.AsyncClient(
         verify=verify,
         limits=httpx2.Limits(keepalive_expiry=keepalive_expiry),
@@ -264,11 +295,8 @@ def _anthropic_api_key(api_key: APIKey) -> str:
 
 @lru_cache(maxsize=1)
 def _owned_chat_anthropic_type() -> type[Any]:
-    try:
-        from langchain_anthropic import ChatAnthropic
-        from pydantic import PrivateAttr
-    except ImportError as exc:  # pragma: no cover - dependency error path
-        raise ModelConfigurationError("Anthropic model support requires localmcplib[llm]") from exc
+    from langchain_anthropic import ChatAnthropic
+    from pydantic import PrivateAttr
 
     class OwnedTransportChatAnthropic(ChatAnthropic):
         """Async-only ChatAnthropic using the transport owned by this library."""
@@ -295,10 +323,8 @@ def _create_openai_model(
     kwargs: Mapping[str, Any],
     endpoint: GatewayEndpoint | None,
 ) -> Any:
-    try:
-        from langchain_openai import ChatOpenAI
-    except ImportError as exc:  # pragma: no cover - dependency error path
-        raise ModelConfigurationError("model support requires localmcplib[llm]") from exc
+    from langchain_openai import ChatOpenAI
+
     constructor: dict[str, Any] = {
         "model": model_id,
         "api_key": _openai_api_key(api_key),
@@ -320,10 +346,8 @@ def _create_anthropic_model(
     kwargs: Mapping[str, Any],
     endpoint: GatewayEndpoint | None,
 ) -> Any:
-    try:
-        import anthropic
-    except ImportError as exc:  # pragma: no cover - dependency error path
-        raise ModelConfigurationError("Anthropic model support requires localmcplib[llm]") from exc
+    import anthropic
+
     raw_api_key = _anthropic_api_key(api_key)
     client_kwargs: dict[str, Any] = {"api_key": raw_api_key, "http_client": client}
     model_kwargs: dict[str, Any] = {
@@ -536,6 +560,7 @@ class ConfiguredModelFactory:
         native_http_client_factory: NativeHTTPClientFactory | None = None,
         default_max_output_tokens: int = 8_000,
     ) -> None:
+        self.registry = registry
         self.config = config
         if config.backend == "openai_compatible":
             if gateway_api_key is None:
