@@ -127,10 +127,23 @@ Anthropic credentials. Gateway protocol dialect and native provider are
 separate model properties, so switching deployment does not require changing
 application model roles.
 
-Gateways do not always forward native structured-output constraints to the
-provider. `localmcp.structured_output.FencedJSONOutputMiddleware` lets a
-`ProviderStrategy` agent accept a response wrapped in one Markdown JSON fence,
-still validated against the same schema.
+Structured output from tool-using agents varies by model and gateway.
+LangChain's `ToolStrategy` forces `tool_choice`, which some models reject (for
+example with extended thinking), and `ProviderStrategy` relies on a native
+schema constraint that gateways may drop or that lets a model answer without
+using its other tools. `localmcp.structured_output.SubmitResultMiddleware`
+works across tool-capable models: it registers an ordinary, unforced
+`submit_result` tool whose arguments are the schema, returns validation errors
+and plain-text answers to the model for correction, and raises
+`SubmitResultError` after `max_attempts` (default 5) failed attempts:
+
+```python
+agent = create_agent(model, tools, middleware=[SubmitResultMiddleware(Answer)])
+answer = (await agent.ainvoke({"messages": [("user", "...")]}))["structured_response"]
+```
+
+For `ProviderStrategy` agents, `FencedJSONOutputMiddleware` accepts a response
+wrapped in one Markdown JSON fence, still validated against the same schema.
 
 ### Sandboxing
 
