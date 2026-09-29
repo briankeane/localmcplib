@@ -1,5 +1,6 @@
 import asyncio
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,7 @@ from localmcp.sandbox import (
     SandboxRoot,
     seatbelt,
 )
-from localmcp.sandbox.seatbelt import MacOSSandbox
+from localmcp.sandbox.seatbelt import MacOSSandbox, _resolve_git
 
 
 class _Process:
@@ -538,3 +539,52 @@ async def test_sandbox_tool_reports_budget_success_and_failure(monkeypatch: pyte
         "error": "Bash failed with SandboxError: unavailable",
         "tool_budget": {"scope": "available"},
     }
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the /usr/bin/git shim is macOS-only")
+def test_resolved_git_is_not_the_xcode_shim() -> None:
+    git = _resolve_git()
+    if git is None:
+        pytest.skip("no git toolchain available on this machine")
+
+    # /usr/bin/git is the libxcselect shim; a real git must resolve elsewhere.
+    assert git != Path("/usr/bin/git")
+    assert git.is_file()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="libexec/git-core layout is macOS-only")
+def test_git_core_helpers_are_included_in_runtime_reads(tmp_path: Path) -> None:
+    if _resolve_git() is None:
+        pytest.skip("no git toolchain available on this machine")
+
+    sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path),)))
+
+    git_core_dirs = [path for path in sandbox._runtime_directories if path.name == "git-core"]
+    assert git_core_dirs, "libexec/git-core helpers directory must be granted to the sandbox"
+    for directory in git_core_dirs:
+        assert directory.is_dir()
+        assert any(directory.iterdir())
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+@pytest.mark.asyncio
+async def test_git_runs_inside_a_read_only_sandbox(tmp_path: Path) -> None:
+    if _resolve_git() is None or not Path("/usr/bin/sandbox-exec").is_file():
+        pytest.skip("no git toolchain or sandbox-exec available on this machine")
+
+    sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path, RootAccess.READ_ONLY),)))
+
+    # Build the repo with the resolved git and the sandbox's own sanitized env so the
+    # fixture is hermetic: no inherited global config/hooks/GIT_CONFIG_* (e.g. a host
+    # commit.gpgsign=true) can make setup fail before the sandbox assertions run.
+    git = str(_resolve_git())
+    env = sandbox._environment()
+    (tmp_path / "file.txt").write_text("first\nsecond\n")
+    commit = (git, "-c", "user.email=t@e.st", "-c", "user.name=Tester")
+    for argv in ((git, "init", "-q"), (git, "add", "file.txt"), (*commit, "commit", "-qm", "seed")):
+        subprocess.run(argv, cwd=tmp_path, check=True, env=env)
+
+    for command in ("git log --oneline", "git show HEAD", "git blame file.txt"):
+        result = await sandbox.run(command)
+        assert result.exit_code == 0, f"{command!r} failed: {result.stderr}"
+        assert result.stderr.strip() == ""

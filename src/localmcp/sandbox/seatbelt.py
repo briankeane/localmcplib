@@ -135,6 +135,63 @@ def _runtime_read_directories(paths: tuple[Path, ...]) -> tuple[Path, ...]:
     return tuple(sorted(directories, key=os.fspath))
 
 
+_XCODE_SHIM = Path("/usr/bin/git")
+
+
+def _resolve_executable(candidate: str | os.PathLike[str] | None) -> Path | None:
+    if not candidate:
+        return None
+    try:
+        resolved = Path(candidate).resolve(strict=True)
+    except OSError:
+        return None
+    return resolved if resolved.is_file() else None
+
+
+def _resolve_git() -> Path | None:
+    """Resolve a real git binary, bypassing the ``/usr/bin/git`` libxcselect shim.
+
+    ``/usr/bin/git`` is not git: it reads ``/var/db/xcode_select_link`` and re-execs
+    the toolchain git under the developer dir. Both reads sit outside the default-deny
+    sandbox, so the shim (and every subcommand) fails. A ``git`` on PATH somewhere other
+    than that shim (e.g. Homebrew) is a real binary and is used unchanged; otherwise the
+    real binary is located from the active developer directory via ``xcrun``/``xcode-select``.
+    """
+    which_git = _resolve_executable(shutil.which("git"))
+    if which_git is not None and which_git != _XCODE_SHIM:
+        return which_git
+
+    for argv in (["/usr/bin/xcrun", "-f", "git"], ["/usr/bin/xcode-select", "-p"]):
+        try:
+            result = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode != 0:
+            continue
+        value = result.stdout.strip()
+        if not value:
+            continue
+        candidate = value if argv[1] == "-f" else os.path.join(value, "usr", "bin", "git")
+        real = _resolve_executable(candidate)
+        if real is not None and real != _XCODE_SHIM:
+            return real
+
+    # Nothing better than the shim (or no git at all): expose whatever exists.
+    return which_git or _resolve_executable(_XCODE_SHIM)
+
+
+def _git_core_directories(git: Path | None) -> tuple[Path, ...]:
+    """Locate the sibling ``libexec/git-core`` helpers dir git dispatches subcommands through."""
+    if git is None:
+        return ()
+    candidate = git.parent.parent / "libexec" / "git-core"
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return ()
+    return (resolved,) if resolved.is_dir() else ()
+
+
 def _path_ancestors(paths: tuple[Path, ...]) -> tuple[Path, ...]:
     ancestors: set[Path] = set()
     for path in paths:
@@ -206,16 +263,25 @@ class MacOSSandbox:
         self.process_label = process_label
         self._sandbox_exec = Path("/usr/bin/sandbox-exec")
         self._shell = Path("/bin/sh")
-        utilities = [shutil.which("rg"), shutil.which("git")]
-        self._executables = tuple(Path(value).resolve(strict=True) for value in utilities if value is not None)
+        git = _resolve_git()
+        rg = _resolve_executable(shutil.which("rg"))
+        self._executables = tuple(executable for executable in (rg, git) if executable is not None)
         self._runtime_paths = tuple(
             sorted(
                 {path for executable in self._executables for path in _runtime_read_paths(executable)}, key=os.fspath
             )
         )
-        self._runtime_directories = _runtime_read_directories(self._runtime_paths)
+        # git dispatches most subcommands through helpers under libexec/git-core; grant it read.
+        self._git_core_directories = _git_core_directories(git)
+        self._runtime_directories = tuple(
+            sorted(set(_runtime_read_directories(self._runtime_paths)) | set(self._git_core_directories), key=os.fspath)
+        )
         self._process_limit = _owned_process_limit()
-        self._metadata_ancestors = _path_ancestors(tuple(root.path for root in self.roots))
+        # Grant metadata reads along the resolved toolchain paths so deep developer-dir
+        # installs (e.g. inside Xcode.app) stay traversable without opening whole trees.
+        self._metadata_ancestors = _path_ancestors(
+            tuple(root.path for root in self.roots) + self._executables + self._git_core_directories
+        )
 
     async def run(self, command: str) -> CommandResult:
         if not command.strip():
@@ -352,6 +418,11 @@ class MacOSSandbox:
             "TMPDIR": os.fspath(self.root),
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null",
+            # Apple's git ignores GIT_CONFIG_SYSTEM for its bundled share/git-core/gitconfig
+            # (full of osxkeychain helpers); NOSYSTEM neutralizes it and keeps git hermetic.
+            "GIT_CONFIG_NOSYSTEM": "1",
+            # Likewise skip the bundled share/git-core/gitattributes the sandbox can't read.
+            "GIT_ATTR_NOSYSTEM": "1",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_TERMINAL_PROMPT": "0",
         }
