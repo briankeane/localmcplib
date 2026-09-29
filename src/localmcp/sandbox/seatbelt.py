@@ -216,6 +216,13 @@ class MacOSSandbox:
         self._runtime_directories = _runtime_read_directories(self._runtime_paths)
         self._process_limit = _owned_process_limit()
         self._metadata_ancestors = _path_ancestors(tuple(root.path for root in self.roots))
+        # Renaming a denied path, or any directory above it inside a root,
+        # would move its contents out from under the read denial.
+        self._denied_ancestors = tuple(
+            ancestor
+            for ancestor in _path_ancestors(self.profile.denied_paths)
+            if any(ancestor.is_relative_to(root.path) for root in self.roots)
+        )
 
     async def run(self, command: str) -> CommandResult:
         if not command.strip():
@@ -263,6 +270,11 @@ class MacOSSandbox:
             for index, path in enumerate(self.profile.denied_paths)
             for value in ("-D", f"DENIED_PATH_{index}={path}")
         ]
+        denied_path_definitions.extend(
+            value
+            for index, path in enumerate(self._denied_ancestors)
+            for value in ("-D", f"DENIED_ANCESTOR_{index}={path}")
+        )
         process = await asyncio.create_subprocess_exec(
             os.fspath(self._sandbox_exec),
             *root_definitions,
@@ -336,6 +348,15 @@ class MacOSSandbox:
         runtime_profile += "".join(
             f'(deny file-read* (literal (param "DENIED_PATH_{index}")) (subpath (param "DENIED_PATH_{index}")))\n'
             for index in range(len(self.profile.denied_paths))
+        )
+        runtime_profile += "".join(
+            f'(deny file-write-unlink (literal (param "DENIED_PATH_{index}")) '
+            f'(subpath (param "DENIED_PATH_{index}")))\n'
+            for index in range(len(self.profile.denied_paths))
+        )
+        runtime_profile += "".join(
+            f'(deny file-write-unlink (literal (param "DENIED_ANCESTOR_{index}")))\n'
+            for index in range(len(self._denied_ancestors))
         )
         return runtime_profile
 

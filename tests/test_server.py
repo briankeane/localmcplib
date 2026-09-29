@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +14,7 @@ from fastmcp.tools import tool
 import localmcp
 import localmcp.server as server_module
 from localmcp.config import ConfigError, ServerConfig
-from localmcp.llm import ConfiguredModelFactory, ModelFactory
+from localmcp.llm import ConfiguredModelFactory, ModelFactory, ModelSpec
 from localmcp.observability.telemetry import LangfuseTelemetry
 from localmcp.server import RuntimeUnavailableError, current_runtime, main
 
@@ -387,6 +388,68 @@ def test_load_config_rejects_invalid_shared_settings(
     env = {"XDG_CONFIG_HOME": str(config_home)}
 
     with pytest.raises(ValueError, match=message):
+        _server().load_config(env=env, home=tmp_path)
+
+
+async def test_llm_models_overlay_catalog_and_inferred_specs(tmp_path: Path) -> None:
+    env = _write_document(tmp_path)
+    path = tmp_path / "config/localmcp/localmcp.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + """
+[llm.models."claude-opus-5"]
+temperature = "omit"
+
+[llm.models."gpt-7"]
+default_reasoning_effort = "medium"
+
+[llm.models."house-model"]
+dialect = "anthropic"
+temperature = "zero"
+
+[llm.models."claude-via-openai"]
+dialect = "openai"
+""",
+        encoding="utf-8",
+    )
+    server = _server()
+
+    await server.start_runtime(env=env, home=tmp_path)
+    factory = current_runtime(_Runtime).model_factory
+
+    assert factory.validate("claude-opus-5") == ModelSpec(temperature="omit", native_provider="anthropic")
+    assert factory.validate("gpt-7").default_reasoning_effort == "medium"
+    assert factory.validate("house-model") == ModelSpec(temperature="zero", dialect="anthropic")
+    assert factory.validate("claude-via-openai") == ModelSpec(
+        temperature="omit", native_provider="anthropic", dialect="openai"
+    )
+    assert factory.validate("claude-sonnet-4-6") == ModelSpec(native_provider="anthropic")
+
+
+@pytest.mark.parametrize(
+    ("models", "message"),
+    [
+        ('[llm.models]\nm = "x"', "llm.models.m must be a TOML table"),
+        ("[llm.models.m]\nunexpected = 1", "llm.models.m has unsupported fields: unexpected"),
+        ("[llm.models.m]\ntemperature = 'hot'", "llm.models.m.temperature must be one of: zero, omit"),
+        ("[llm.models.m]\ndialect = 'gemini'", "llm.models.m.dialect must be one of: anthropic, openai"),
+        ("[llm.models.m]\nsupports_reasoning_effort = 'yes'", "supports_reasoning_effort must be a boolean"),
+        ("[llm.models.m]\ndefault_reasoning_effort = 1", "default_reasoning_effort must be a string"),
+        (
+            "[llm.models.m]\ndialect = 'anthropic'\nsupports_reasoning_effort = true",
+            "llm.models.m: reasoning_effort is supported only by the OpenAI dialect",
+        ),
+        ('[llm.models." "]\ntemperature = "omit"', "llm.models: model IDs must not be blank"),
+    ],
+)
+def test_load_config_rejects_invalid_model_specs(tmp_path: Path, models: str, message: str) -> None:
+    config_home = tmp_path / "config"
+    path = config_home / "localmcp/localmcp.toml"
+    path.parent.mkdir(parents=True)
+    path.write_text(f"[llm]\nbackend = 'native'\n{models}\n")
+    env = {"XDG_CONFIG_HOME": str(config_home)}
+
+    with pytest.raises(ConfigError, match=re.escape(message)):
         _server().load_config(env=env, home=tmp_path)
 
 

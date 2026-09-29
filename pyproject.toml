@@ -1,6 +1,6 @@
 [project]
 name = "localmcplib"
-version = "0.1.4"
+version = "0.2.0"
 description = "Reusable foundations for local stdio MCP servers."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,45 +14,12 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = []
-
-[project.urls]
-Homepage = "https://github.com/salesforce-misc/localmcplib"
-Repository = "https://github.com/salesforce-misc/localmcplib"
-Issues = "https://github.com/salesforce-misc/localmcplib/issues"
-
-[project.optional-dependencies]
-secrets = ["keyring>=25.7.0"]
-llm = [
-    "httpx2>=2.13.0",
-    "langchain-anthropic>=1.7.2",
-    "langchain-openai>=1.6.3",
-]
-sandbox = ["langchain-core>=1.6.4", "pydantic>=2.13.5"]
-observability = ["structlog>=26.1.0"]
-telemetry = [
-    "fastmcp>=4.0.5",
-    "langfuse>=4.15.4,<5",
-    "structlog>=26.1.0",
-]
-server = [
-    "fastmcp>=4.0.5",
-    "httpx2>=2.13.0",
-    "keyring>=25.7.0",
-    "langchain-anthropic>=1.7.2",
-    "langchain-openai>=1.6.3",
-    "structlog>=26.1.0",
-]
-workflows = [
-    "aiosqlite>=0.22.1",
-    "langgraph-checkpoint-sqlite>=3.1.1",
-    "structlog>=26.1.0",
-]
-all = [
+dependencies = [
     "aiosqlite>=0.22.1",
     "fastmcp>=4.0.5",
     "httpx2>=2.13.0",
     "keyring>=25.7.0",
+    "langchain>=1.4.2,<2",
     "langchain-anthropic>=1.7.2",
     "langchain-core>=1.6.4",
     "langchain-openai>=1.6.3",
@@ -61,6 +28,11 @@ all = [
     "pydantic>=2.13.5",
     "structlog>=26.1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/salesforce-misc/localmcplib"
+Repository = "https://github.com/salesforce-misc/localmcplib"
+Issues = "https://github.com/salesforce-misc/localmcplib/issues"
 
 [build-system]
 requires = ["uv_build>=0.12.17,<0.13.0"]
@@ -84,6 +56,10 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = ["--strict-markers"]
+markers = [
+    "seatbelt: end-to-end tests against the real macOS Seatbelt sandbox (set LOCALMCP_REQUIRE_SEATBELT=1 to fail instead of skip when unavailable)",
+]
 
 [tool.coverage.run]
 branch = true
