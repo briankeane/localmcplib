@@ -135,7 +135,9 @@ using its other tools. `localmcp.structured_output.SubmitResultMiddleware`
 works across tool-capable models: it registers an ordinary, unforced
 `submit_result` tool whose arguments are the schema, returns validation errors
 and plain-text answers to the model for correction, and raises
-`SubmitResultError` after `max_attempts` (default 5) failed attempts:
+`SubmitResultError` after `max_attempts` (default 5) failed attempts in a run.
+Tool calls whose arguments cannot be parsed are answered with an error rather
+than replayed to the provider verbatim:
 
 ```python
 agent = create_agent(model, tools, middleware=[SubmitResultMiddleware(Answer)])

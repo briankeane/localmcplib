@@ -9,7 +9,8 @@ from typing import Annotated, Any, NotRequired
 from langchain.agents.middleware import AgentMiddleware, AgentState, ModelRequest, ModelResponse, hook_config
 from langchain.agents.middleware.types import PrivateStateAttr
 from langchain.agents.structured_output import StructuredOutputError, StructuredOutputValidationError
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages.tool import tool_call
 from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, ValidationError
@@ -109,7 +110,10 @@ class SubmitResultMiddleware[SchemaT: BaseModel](AgentMiddleware[_SubmitResultSt
     plain-text final answer is answered with a reminder, and an invalid
     submission with its validation errors, before returning to the model. Each
     counts as one attempt; exhausting ``max_attempts`` raises
-    :class:`SubmitResultError`. Do not combine this with ``response_format``.
+    :class:`SubmitResultError`. The count restarts with every run. Tool calls
+    whose arguments could not be parsed are rewritten with empty arguments and
+    answered with an error instead of being replayed to the provider. Do not
+    combine this with ``response_format``.
     """
 
     state_schema = _SubmitResultState
@@ -173,6 +177,13 @@ class SubmitResultMiddleware[SchemaT: BaseModel](AgentMiddleware[_SubmitResultSt
     ) -> ModelResponse:
         return await handler(self._with_instruction(request))
 
+    def before_agent(self, state: _SubmitResultState, runtime: Runtime[Any]) -> dict[str, Any] | None:
+        # The counter is a checkpointed channel; reset it so a reused thread starts each run with a full budget.
+        return {"submit_result_attempts": 0}
+
+    async def abefore_agent(self, state: _SubmitResultState, runtime: Runtime[Any]) -> dict[str, Any] | None:
+        return self.before_agent(state, runtime)
+
     @hook_config(can_jump_to=["model", "end"])
     def after_model(self, state: _SubmitResultState, runtime: Runtime[Any]) -> dict[str, Any] | None:
         message = state["messages"][-1] if state["messages"] else None
@@ -180,8 +191,20 @@ class SubmitResultMiddleware[SchemaT: BaseModel](AgentMiddleware[_SubmitResultSt
             return None
         submissions = [call for call in message.tool_calls if call["name"] == self._tool_name]
         others = [call for call in message.tool_calls if call["name"] != self._tool_name]
-        if others and not submissions:
+        if others and not submissions and not message.invalid_tool_calls:
             return None
+
+        # Providers replay unparseable arguments verbatim, which some backends reject for the rest of the run.
+        # Rewrite them as empty-object calls and answer each one here so the tools node never runs them.
+        unparsed = [
+            tool_call(name=call["name"] or "", args={}, id=call["id"] or f"invalid_{index}")
+            for index, call in enumerate(message.invalid_tool_calls)
+        ]
+        replies: list[AnyMessage] = []
+        if unparsed:
+            replies.append(
+                message.model_copy(update={"tool_calls": [*message.tool_calls, *unparsed], "invalid_tool_calls": []})
+            )
 
         if len(submissions) == 1:
             try:
@@ -189,10 +212,10 @@ class SubmitResultMiddleware[SchemaT: BaseModel](AgentMiddleware[_SubmitResultSt
             except ValidationError as exc:
                 feedback = f"Invalid {self._tool_name} arguments:\n{_format_validation_error(exc)}"
             else:
-                replies = [ToolMessage(content="Result submitted.", tool_call_id=submissions[0]["id"] or "")]
+                replies.append(ToolMessage(content="Result submitted.", tool_call_id=submissions[0]["id"] or ""))
                 replies += [
                     ToolMessage(content="Not run: the result was already submitted.", tool_call_id=call["id"] or "")
-                    for call in others
+                    for call in [*others, *unparsed]
                 ]
                 return {"messages": replies, "structured_response": result, "jump_to": "end"}
         elif submissions:
@@ -200,20 +223,32 @@ class SubmitResultMiddleware[SchemaT: BaseModel](AgentMiddleware[_SubmitResultSt
         else:
             feedback = ""
 
-        attempts = state.get("submit_result_attempts", 0) + 1
-        if attempts >= self._max_attempts:
-            raise SubmitResultError(self._tool_name, attempts, message)
-        update: dict[str, Any] = {"submit_result_attempts": attempts}
-        if submissions:
-            update["messages"] = [
-                ToolMessage(content=feedback, tool_call_id=call["id"] or "", status="error") for call in submissions
-            ]
-            # Other tool calls in the same turn still run; the tools node then returns to the model.
-            if not others:
-                update["jump_to"] = "model"
-        else:
-            update["messages"] = [HumanMessage(content=f"You have not submitted a result. {self._instruction}")]
+        replies += [
+            ToolMessage(
+                content=f"Not run: the {call['name'] or 'tool'} arguments were not a valid JSON object. "
+                "Call it again with valid JSON arguments.",
+                tool_call_id=call["id"],
+                status="error",
+            )
+            for call in unparsed
+        ]
+        replies += [
+            ToolMessage(content=feedback, tool_call_id=call["id"] or "", status="error") for call in submissions
+        ]
+        failed_submission = bool(submissions) or any(call["name"] == self._tool_name for call in unparsed)
+        # Other valid tool calls still run and the tools node then returns to the model; a turn with none of them
+        # makes no progress and is answered directly.
+        update: dict[str, Any] = {}
+        if not others:
             update["jump_to"] = "model"
+            if not submissions and not unparsed:
+                replies.append(HumanMessage(content=f"You have not submitted a result. {self._instruction}"))
+        if failed_submission or not others:
+            attempts = state.get("submit_result_attempts", 0) + 1
+            if attempts >= self._max_attempts:
+                raise SubmitResultError(self._tool_name, attempts, message)
+            update["submit_result_attempts"] = attempts
+        update["messages"] = replies
         return update
 
     async def aafter_model(self, state: _SubmitResultState, runtime: Runtime[Any]) -> dict[str, Any] | None:
