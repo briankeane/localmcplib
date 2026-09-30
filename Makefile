@@ -2,14 +2,14 @@
 # `make` with no target prints help.
 
 .DEFAULT_GOAL := help
-.PHONY: help install format format-check lint lint-fix typecheck test coverage build clean ci
+.PHONY: help install format format-check lint lint-fix typecheck test test-seatbelt coverage build clean ci
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 
-install: ## Sync the venv from the lockfile (incl. all extras and dev deps)
-	uv sync --all-extras --locked
+install: ## Sync the venv from the lockfile (incl. dev deps)
+	uv sync --locked
 
 format: ## Format code with ruff
 	uv run ruff format .
@@ -28,6 +28,9 @@ typecheck: ## Type-check the package with mypy
 
 test: ## Run the test suite
 	uv run pytest
+
+test-seatbelt: ## Run real Seatbelt enforcement tests (macOS only; fails instead of skipping)
+	LOCALMCP_REQUIRE_SEATBELT=1 uv run pytest -m seatbelt -v
 
 coverage: ## Run tests with coverage and write coverage.xml
 	uv run pytest --cov=localmcp --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=90

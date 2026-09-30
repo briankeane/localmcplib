@@ -24,10 +24,10 @@ policy.
 
 ## Quickstart
 
-Install the integrated server capability:
+Install the package:
 
 ```console
-uv add 'localmcplib[server]'
+uv add localmcplib
 ```
 
 The following complete `hello.py` registers one tool and runs it as a FastMCP
@@ -127,6 +127,26 @@ Anthropic credentials. Gateway protocol dialect and native provider are
 separate model properties, so switching deployment does not require changing
 application model roles.
 
+Structured output from tool-using agents varies by model and gateway.
+LangChain's `ToolStrategy` forces `tool_choice`, which some models reject (for
+example with extended thinking), and `ProviderStrategy` relies on a native
+schema constraint that gateways may drop or that lets a model answer without
+using its other tools. `localmcp.structured_output.SubmitResultMiddleware`
+works across tool-capable models: it registers an ordinary, unforced
+`submit_result` tool whose arguments are the schema, returns validation errors
+and plain-text answers to the model for correction, and raises
+`SubmitResultError` after `max_attempts` (default 5) failed attempts in a run.
+Tool calls whose arguments cannot be parsed are answered with an error rather
+than replayed to the provider verbatim:
+
+```python
+agent = create_agent(model, tools, middleware=[SubmitResultMiddleware(Answer)])
+answer = (await agent.ainvoke({"messages": [("user", "...")]}))["structured_response"]
+```
+
+For `ProviderStrategy` agents, `FencedJSONOutputMiddleware` accepts a response
+wrapped in one Markdown JSON fence, still validated against the same schema.
+
 ### Sandboxing
 
 The sandbox API provides bounded command execution with explicit filesystem
@@ -150,27 +170,6 @@ default. Set `LOCALMCP_LANGFUSE_CAPTURE_PAYLOADS=true` to capture model prompts,
 model responses, tool arguments, and tool results. This opt-in can send secrets,
 repository content, and other sensitive data to Langfuse; enable it only when
 the configured Langfuse project is an approved destination for those payloads.
-
-## Capability extras
-
-Install only what an application uses:
-
-| Extra | Capability |
-| --- | --- |
-| `server` | Integrated FastMCP stdio application composition |
-| `secrets` | OS-keyring secret resolution |
-| `llm` | OpenAI-compatible and native OpenAI/Anthropic models |
-| `sandbox` | Portable sandbox API and macOS Seatbelt implementation |
-| `observability` | Structured file logging |
-| `telemetry` | Langfuse and FastMCP telemetry integration |
-| `workflows` | Durable LangGraph and SQLite workflow foundations |
-| `all` | Every optional capability |
-
-For example:
-
-```console
-uv add 'localmcplib[server,sandbox,workflows]'
-```
 
 ## Status
 

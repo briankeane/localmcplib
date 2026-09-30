@@ -1,3 +1,5 @@
+import logging
+import os
 from typing import Any
 
 import pytest
@@ -16,6 +18,7 @@ from localmcp.llm import (
     OpenAICompatibleEndpoint,
     OpenAICompatibleModelFactory,
     OwnedChatModel,
+    infer_model_spec,
 )
 
 
@@ -146,8 +149,72 @@ def test_registry_overlay_and_reasoning_validation(monkeypatch: pytest.MonkeyPat
     assert registry.resolve("base") == ModelSpec()
     with pytest.raises(ModelConfigurationError, match="does not support"):
         factory.create("other", reasoning_effort="high")
-    with pytest.raises(ModelConfigurationError, match="unknown"):
-        factory.create("missing")
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        ("claude-opus-9", ModelSpec(temperature="omit", native_provider="anthropic")),
+        ("gpt-7", ModelSpec(temperature="omit", supports_reasoning_effort=True, native_provider="openai")),
+        ("o5-mini", ModelSpec(temperature="omit", supports_reasoning_effort=True, native_provider="openai")),
+        ("gemini-9-pro", ModelSpec(temperature="omit", supports_reasoning_effort=True)),
+    ],
+)
+def test_unregistered_models_resolve_to_inferred_specs(model_id: str, expected: ModelSpec) -> None:
+    assert ModelRegistry().resolve(model_id) == expected
+    assert infer_model_spec(model_id) == expected
+
+
+def test_unregistered_model_warns_once_and_blank_ids_are_rejected(caplog: pytest.LogCaptureFixture) -> None:
+    registry = ModelRegistry()
+
+    with caplog.at_level(logging.WARNING, logger="localmcp.llm"):
+        registry.resolve("warn-once-model")
+        registry.resolve("warn-once-model")
+
+    assert [record.getMessage() for record in caplog.records] == [
+        'model "warn-once-model" is not in the catalog; using inferred capabilities'
+    ]
+    with pytest.raises(ModelConfigurationError, match="must not be blank"):
+        registry.resolve(" ")
+
+
+async def test_unregistered_model_passes_through_to_the_gateway(monkeypatch: pytest.MonkeyPatch) -> None:
+    import langchain_openai
+
+    monkeypatch.setattr(langchain_openai, "ChatOpenAI", FakeChatOpenAI)
+    factory = OpenAICompatibleModelFactory(
+        ModelRegistry(),
+        OpenAICompatibleEndpoint("https://gateway.example/v1"),
+        "token",
+        http_client_factory=lambda _: FakeClient(),
+    )
+
+    async with factory.create("gpt-7", reasoning_effort="high") as model:
+        assert model.kwargs["model"] == "gpt-7"
+        assert model.kwargs["reasoning_effort"] == "high"
+        assert "temperature" not in model.kwargs
+
+
+def test_unregistered_models_route_by_inferred_provider() -> None:
+    gateway = ConfiguredModelFactory(
+        ModelRegistry(),
+        LLMBackendConfig(backend="openai_compatible", base_url="https://gateway.example/v1"),
+        gateway_api_key="gateway-token",
+    )
+    native = ConfiguredModelFactory(
+        ModelRegistry(),
+        LLMBackendConfig(backend="native"),
+        anthropic_api_key="anthropic-token",
+    )
+
+    assert gateway.registry.resolve("claude-opus-9") == gateway.validate("claude-opus-9")
+    assert gateway.validate("claude-opus-9").adapter_dialect == "anthropic"
+    assert native.validate("claude-opus-9").native_provider == "anthropic"
+    with pytest.raises(ModelConfigurationError, match="does not support reasoning_effort"):
+        gateway.validate("claude-opus-9", reasoning_effort="high")
+    with pytest.raises(ModelConfigurationError, match='"gemini-9-pro" is available only through a gateway'):
+        native.validate("gemini-9-pro")
 
 
 def test_backend_selection_is_explicit_and_validates_gateway_state() -> None:
@@ -157,10 +224,16 @@ def test_backend_selection_is_explicit_and_validates_gateway_state() -> None:
         LLMBackendConfig(backend="native", base_url="https://stale-gateway.example/v1")
 
 
-async def test_configured_factory_switches_one_model_between_gateway_and_native() -> None:
+async def test_configured_factory_switches_one_model_between_gateway_and_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import httpx2
     from langchain_anthropic import ChatAnthropic
     from langchain_openai import ChatOpenAI
+
+    # The Anthropic client reads ANTHROPIC_BASE_URL and friends from the caller's shell.
+    for name in [name for name in os.environ if name.startswith("ANTHROPIC_")]:
+        monkeypatch.delenv(name)
 
     registry = ModelRegistry(
         {

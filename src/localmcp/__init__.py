@@ -1,7 +1,7 @@
 """Reusable foundations for local MCP servers.
 
-Optional capabilities are resolved lazily so importing :mod:`localmcp` alone
-does not require an LLM, MCP, telemetry, or workflow stack.
+The server composition is resolved lazily so importing :mod:`localmcp` alone
+does not load the LLM, MCP, telemetry, or workflow stack.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 __all__ = ["STDIOServer", "main"]
 
-__version__ = "0.1.3"
+__version__ = "0.2.2"
 
 
 def __getattr__(name: str) -> Any:

@@ -6,14 +6,24 @@ import os
 import sys
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, cast
 
 from fastmcp import FastMCP
 
 from localmcp.config import ConfigDocument, ConfigError, LocalMCPPaths, ServerConfig
-from localmcp.llm import DEFAULT_MODEL_REGISTRY, ConfiguredModelFactory, LLMBackend, LLMBackendConfig, ModelFactory
+from localmcp.llm import (
+    DEFAULT_MODEL_REGISTRY,
+    ConfiguredModelFactory,
+    LLMBackend,
+    LLMBackendConfig,
+    ModelConfigurationError,
+    ModelFactory,
+    ModelRegistry,
+    ModelSpec,
+    infer_model_spec,
+)
 from localmcp.observability.logging import configure_logging, get_logger, resolve_log_level
 from localmcp.observability.telemetry import (
     LangfuseTelemetry,
@@ -62,6 +72,7 @@ class _ServerSettings:
     """Validated localmcplib settings for one effective server view."""
 
     llm: LLMBackendConfig
+    registry: ModelRegistry
     observability: _ObservabilitySettings
 
 
@@ -98,6 +109,9 @@ class STDIOServer[ConfigT, RuntimeT: RuntimeLifecycle]:
         self.openai_secret_name = openai_secret_name
         self.anthropic_secret_name = anthropic_secret_name
         self.log_level_env = log_level_env
+        # Replaced by the configured catalog in start_runtime; kept off the
+        # _model_factory signature so subclass overrides remain compatible.
+        self._model_registry = DEFAULT_MODEL_REGISTRY
 
         @asynccontextmanager
         async def lifespan(_server: FastMCP) -> AsyncIterator[ConfigT]:
@@ -150,6 +164,7 @@ class STDIOServer[ConfigT, RuntimeT: RuntimeLifecycle]:
         document, shared, config = self._load_config(env=env, home=home)
         catalog = SecretCatalog.from_config(document, server=self.name)
         resolver = SecretResolver(env, tolerate_keyring_errors=True)
+        self._model_registry = shared.registry
         model_factory = self._model_factory(shared.llm, catalog, resolver)
         telemetry_service = LangfuseTelemetry(env)
         install_telemetry(telemetry_service)
@@ -178,12 +193,12 @@ class STDIOServer[ConfigT, RuntimeT: RuntimeLifecycle]:
         if config.backend == "openai_compatible":
             gateway_api_key = _secret_provider(catalog, resolver, self.llm_secret_name, required=True)
             return ConfiguredModelFactory(
-                DEFAULT_MODEL_REGISTRY,
+                self._model_registry,
                 config,
                 gateway_api_key=gateway_api_key,
             )
         return ConfiguredModelFactory(
-            DEFAULT_MODEL_REGISTRY,
+            self._model_registry,
             config,
             openai_api_key=_secret_provider(catalog, resolver, self.openai_secret_name),
             anthropic_api_key=_secret_provider(catalog, resolver, self.anthropic_secret_name),
@@ -238,7 +253,7 @@ def main[ConfigT, RuntimeT: RuntimeLifecycle](server: STDIOServer[ConfigT, Runti
 
 def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
     llm = _table(config.values.get("llm"), field="llm")
-    supported_llm_fields = {"backend", "base_url", "default_headers", "verify", "keepalive_expiry"}
+    supported_llm_fields = {"backend", "base_url", "default_headers", "verify", "keepalive_expiry", "models"}
     unsupported = set(llm) - supported_llm_fields
     if unsupported:
         raise ConfigError(f"llm has unsupported fields: {', '.join(sorted(unsupported))}")
@@ -265,6 +280,7 @@ def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
     keepalive_expiry = llm.get("keepalive_expiry", 5.0)
     if isinstance(keepalive_expiry, bool) or not isinstance(keepalive_expiry, int | float):
         raise ConfigError("llm.keepalive_expiry must be a number")
+    registry = _parse_model_specs(_table(llm.get("models", {}), field="llm.models"))
 
     observability = _table(config.values.get("observability", {}), field="observability")
     unsupported = set(observability) - {"log_level"}
@@ -282,8 +298,65 @@ def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
             verify=verify,
             keepalive_expiry=float(keepalive_expiry),
         ),
+        registry=registry,
         observability=_ObservabilitySettings(log_level=log_level),
     )
+
+
+_MODEL_SPEC_CHOICES: Mapping[str, tuple[str, ...]] = {
+    "temperature": ("zero", "omit"),
+    "native_provider": ("anthropic", "openai"),
+    "dialect": ("anthropic", "openai"),
+}
+
+
+def _parse_model_specs(models: Mapping[str, object]) -> ModelRegistry:
+    """Overlay ``[llm.models]`` entries on the built-in catalog.
+
+    Each entry updates only the fields it names, starting from the built-in
+    spec when the ID is catalogued and from the inferred spec otherwise.
+    """
+    catalog = DEFAULT_MODEL_REGISTRY.as_mapping()
+    overrides: dict[str, ModelSpec] = {}
+    for model_id, raw in models.items():
+        field = f"llm.models.{model_id}"
+        entry = _table(raw, field=field)
+        unsupported = set(entry) - {*_MODEL_SPEC_CHOICES, "supports_reasoning_effort", "default_reasoning_effort"}
+        if unsupported:
+            raise ConfigError(f"{field} has unsupported fields: {', '.join(sorted(unsupported))}")
+        updates: dict[str, Any] = {}
+        for name, choices in _MODEL_SPEC_CHOICES.items():
+            if name in entry:
+                value = entry[name]
+                if value not in choices:
+                    raise ConfigError(f"{field}.{name} must be one of: {', '.join(choices)}")
+                updates[name] = value
+        if "supports_reasoning_effort" in entry:
+            if not isinstance(entry["supports_reasoning_effort"], bool):
+                raise ConfigError(f"{field}.supports_reasoning_effort must be a boolean")
+            updates["supports_reasoning_effort"] = entry["supports_reasoning_effort"]
+        if "default_reasoning_effort" in entry:
+            if not isinstance(entry["default_reasoning_effort"], str):
+                raise ConfigError(f"{field}.default_reasoning_effort must be a string")
+            updates["default_reasoning_effort"] = entry["default_reasoning_effort"]
+        base = catalog.get(model_id) or infer_model_spec(model_id)
+        if "supports_reasoning_effort" not in updates and ("dialect" in updates or "native_provider" in updates):
+            # A dialect change can invalidate an inherited reasoning capability;
+            # only an explicit setting keeps it.
+            dialect = (
+                updates.get("dialect", base.dialect) or updates.get("native_provider", base.native_provider) or "openai"
+            )
+            if dialect != "openai":
+                updates.setdefault("supports_reasoning_effort", False)
+                updates.setdefault("default_reasoning_effort", None)
+        try:
+            overrides[model_id] = replace(base, **updates)
+        except ModelConfigurationError as exc:
+            raise ConfigError(f"{field}: {exc}") from exc
+    try:
+        return DEFAULT_MODEL_REGISTRY.overlay(overrides)
+    except ModelConfigurationError as exc:
+        raise ConfigError(f"llm.models: {exc}") from exc
 
 
 def _application_config(config: ServerConfig) -> ServerConfig:
