@@ -1,6 +1,5 @@
 import asyncio
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +14,7 @@ from localmcp.sandbox import (
     SandboxRoot,
     seatbelt,
 )
-from localmcp.sandbox.seatbelt import MacOSSandbox, _resolve_utility
+from localmcp.sandbox.seatbelt import MacOSSandbox, _developer_directory, _git_exec_path
 
 
 class _Process:
@@ -542,87 +541,147 @@ async def test_sandbox_tool_reports_budget_success_and_failure(monkeypatch: pyte
     }
 
 
-def test_resolve_utility_prefers_a_non_shim_path_without_probing_xcrun(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A real binary on PATH (e.g. Homebrew) is used as-is; xcrun must not be consulted.
-    _resolve_utility.cache_clear()
-    real = Path("/opt/homebrew/bin/git")
-    monkeypatch.setattr(seatbelt.shutil, "which", lambda name: str(real))
-    monkeypatch.setattr(seatbelt, "_resolve_executable", lambda candidate: Path(candidate) if candidate else None)
-
-    def fail_xcrun(name: str) -> Path | None:
-        raise AssertionError("xcrun should not be probed when PATH holds a real binary")
-
-    monkeypatch.setattr(seatbelt, "_resolve_via_xcrun", fail_xcrun)
-    assert _resolve_utility("git") == real
-    _resolve_utility.cache_clear()
+def _fake_xcode(tmp_path: Path) -> Path:
+    developer = tmp_path / "Xcode.app" / "Contents" / "Developer"
+    (developer / "usr" / "bin").mkdir(parents=True)
+    (developer / "Toolchains" / "XcodeDefault.xctoolchain" / "usr" / "bin").mkdir(parents=True)
+    return developer
 
 
-def test_resolve_utility_returns_none_when_only_the_shim_exists_and_toolchain_is_broken(
-    monkeypatch: pytest.MonkeyPatch,
+def test_developer_directory_prefers_developer_dir_and_accepts_an_app_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # PATH yields only the /usr/bin shim and developer-dir discovery fails: advertise nothing
-    # rather than a git that cannot run under the sandbox.
-    _resolve_utility.cache_clear()
-    monkeypatch.setattr(seatbelt.shutil, "which", lambda name: "/usr/bin/git")
-    monkeypatch.setattr(seatbelt, "_resolve_executable", lambda candidate: Path(candidate) if candidate else None)
-    monkeypatch.setattr(seatbelt, "_resolve_via_xcrun", lambda name: None)
-    assert _resolve_utility("git") is None
-    _resolve_utility.cache_clear()
+    developer = _fake_xcode(tmp_path)
+    monkeypatch.setattr(seatbelt.subprocess, "run", lambda *args, **kwargs: pytest.fail("must not probe"))
+    _developer_directory.cache_clear()
+
+    assert _developer_directory(str(developer)) == developer.resolve()
+    assert _developer_directory(str(tmp_path / "Xcode.app")) == developer.resolve()
+    assert _developer_directory(str(tmp_path / "missing")) is None
+    assert _developer_directory(str(tmp_path)) is None
+    _developer_directory.cache_clear()
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="the /usr/bin/git shim is macOS-only")
-def test_resolved_git_is_not_the_xcode_shim() -> None:
-    git = _resolve_utility("git")
-    if git is None:
-        pytest.skip("no git toolchain available on this machine")
+@pytest.mark.parametrize("outcome", ["selected", "unselected", "error"])
+def test_developer_directory_falls_back_to_xcode_select(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+) -> None:
+    developer = _fake_xcode(tmp_path)
+    calls: list[list[str]] = []
 
-    # /usr/bin/git is the libxcselect shim; a real git must resolve elsewhere.
-    assert git != Path("/usr/bin/git")
-    assert git.is_file()
+    def run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if outcome == "error":
+            raise OSError("missing")
+        return subprocess.CompletedProcess(argv, 0 if outcome == "selected" else 2, f"{developer}\n", "")
+
+    monkeypatch.setattr(seatbelt.subprocess, "run", run)
+    _developer_directory.cache_clear()
+
+    assert _developer_directory(None) == (developer.resolve() if outcome == "selected" else None)
+    # Never xcrun or a /usr/bin shim: those can raise the Command Line Tools install prompt.
+    assert calls == [["/usr/bin/xcode-select", "-p"]]
+    _developer_directory.cache_clear()
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="libexec/git-core layout is macOS-only")
-def test_git_core_helpers_are_granted_read_and_exec(tmp_path: Path) -> None:
-    if _resolve_utility("git") is None:
-        pytest.skip("no git toolchain available on this machine")
+def test_dev_tools_grants_the_xcode_bundle_and_license(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    developer = _fake_xcode(tmp_path).resolve()
+    monkeypatch.setattr(seatbelt, "_developer_directory", lambda _value: developer)
+
+    sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(root),), dev_tools=True))
+
+    assert sandbox.profile.dev_tools is True
+    assert sandbox._developer_installation == developer.parent.parent
+    assert sandbox._developer_preferences == (seatbelt._XCODE_LICENSE,)
+    assert set(developer.parent.parent.parents) - {Path("/")} <= set(sandbox._metadata_ancestors)
+    profile = sandbox._compiled_profile()
+    assert '(allow file-read* file-map-executable (subpath (param "DEVELOPER_INSTALLATION")))' in profile
+    assert '(allow file-read* (literal (param "DEVELOPER_PREFERENCE_0")))' in profile
+    sandbox._executables = ()
+    environment = sandbox._environment()
+    assert environment["DEVELOPER_DIR"] == str(developer)
+    toolchain = developer / "Toolchains" / "XcodeDefault.xctoolchain"
+    assert environment["PATH"] == f"{developer}/usr/bin:{toolchain}/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def test_dev_tools_grants_a_command_line_tools_install_as_is(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    developer = tmp_path / "CommandLineTools"
+    (developer / "usr" / "bin").mkdir(parents=True)
+    monkeypatch.setattr(seatbelt, "_developer_directory", lambda _value: developer)
+
+    sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(root),), dev_tools=True))
+
+    assert sandbox._developer_installation == developer
+    assert sandbox._developer_preferences == ()
+    assert "DEVELOPER_PREFERENCE" not in sandbox._compiled_profile()
+
+
+def test_dev_tools_rejects_a_toolchain_overlapping_a_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    developer = _fake_xcode(tmp_path).resolve()
+    monkeypatch.setattr(seatbelt, "_developer_directory", lambda _value: developer)
+
+    for root in (tmp_path, developer / "usr"):
+        with pytest.raises(SandboxError, match="overlaps a sandbox root"):
+            MacOSSandbox(SandboxProfile((SandboxRoot(root),), dev_tools=True))
+
+
+def test_toolchain_is_not_granted_without_dev_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(seatbelt, "_developer_directory", lambda _value: pytest.fail("must not look up"))
 
     sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path),)))
 
-    git_core_dirs = [path for path in sandbox._helper_directories if path.name == "git-core"]
-    assert git_core_dirs, "libexec/git-core helpers directory must be granted to the sandbox"
-    for directory in git_core_dirs:
-        assert directory.is_dir()
-        assert any(directory.iterdir())
-
-    # git re-execs its subcommand helpers, so the grant must include exec-mapping, not just read.
-    profile = sandbox._compiled_profile()
-    assert 'file-map-executable (subpath (param "HELPER_DIRECTORY_0"))' in profile
+    assert sandbox._developer_installation is None
+    assert "DEVELOPER_" not in sandbox._compiled_profile()
+    assert "DEVELOPER_DIR" not in sandbox._environment()
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
-@pytest.mark.asyncio
-async def test_git_runs_inside_a_read_only_sandbox(tmp_path: Path) -> None:
-    if _resolve_utility("git") is None or not Path("/usr/bin/sandbox-exec").is_file():
-        pytest.skip("no git toolchain or sandbox-exec available on this machine")
+def test_git_exec_path_never_runs_the_usr_bin_shim(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(seatbelt.subprocess, "run", lambda *args, **kwargs: pytest.fail("must not run the shim"))
+    _git_exec_path.cache_clear()
 
-    sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path, RootAccess.READ_ONLY),)))
+    assert _git_exec_path(Path("/usr/bin/git")) is None
+    _git_exec_path.cache_clear()
 
-    # Build the repo with the resolved git and the sandbox's own sanitized env so the
-    # fixture is hermetic: no inherited global config/hooks/GIT_CONFIG_* (e.g. a host
-    # commit.gpgsign=true) can make setup fail before the sandbox assertions run.
-    git = str(_resolve_utility("git"))
-    env = sandbox._environment()
-    (tmp_path / "file.txt").write_text("first\nsecond\n")
-    commit = (git, "-c", "user.email=t@e.st", "-c", "user.name=Tester")
-    for argv in ((git, "init", "-q"), (git, "add", "file.txt"), (*commit, "commit", "-qm", "seed")):
-        subprocess.run(argv, cwd=tmp_path, check=True, env=env)
 
-    # git can legitimately write advice/hints to stderr while exiting 0, so assert on the
-    # exit code and the expected stdout rather than on empty stderr.
-    result = await sandbox.run("git log --oneline")
-    assert result.exit_code == 0, f"git log failed: {result.stderr}"
-    assert "seed" in result.stdout
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "expected"),
+    [(0, "/opt/git/libexec/git-core\n", Path("/opt/git/libexec/git-core")), (1, "", None), (0, "relative\n", None)],
+)
+def test_git_exec_path_reports_the_compiled_helper_directory(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: str, expected: Path | None
+) -> None:
+    monkeypatch.setattr(
+        seatbelt.subprocess,
+        "run",
+        lambda argv, **_kwargs: subprocess.CompletedProcess(argv, returncode, stdout, ""),
+    )
+    _git_exec_path.cache_clear()
 
-    result = await sandbox.run("git blame file.txt")
-    assert result.exit_code == 0, f"git blame failed: {result.stderr}"
-    assert "first" in result.stdout and "second" in result.stdout
+    assert _git_exec_path(Path("/opt/git/bin/git")) == expected
+    _git_exec_path.cache_clear()
+
+
+def test_git_helpers_behind_a_symlink_are_granted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Homebrew-style: git's exec path runs through opt/git -> ../Cellar/git/<version>.
+    prefix = tmp_path.resolve() / "prefix"
+    cellar = prefix / "Cellar" / "git" / "2.0"
+    (cellar / "bin").mkdir(parents=True)
+    (cellar / "libexec" / "git-core").mkdir(parents=True)
+    git = cellar / "bin" / "git"
+    git.touch()
+    (prefix / "opt").mkdir()
+    (prefix / "opt" / "git").symlink_to(cellar, target_is_directory=True)
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(seatbelt.shutil, "which", lambda name: str(git) if name == "git" else None)
+    monkeypatch.setattr(seatbelt, "_git_exec_path", lambda _git: prefix / "opt" / "git" / "libexec" / "git-core")
+
+    sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(root),)))
+
+    assert sandbox._helper_directories == (cellar / "libexec" / "git-core",)
+    assert {prefix / "opt", prefix / "opt" / "git"} <= set(sandbox._metadata_ancestors)
+    assert 'file-map-executable (subpath (param "HELPER_DIRECTORY_0"))' in sandbox._compiled_profile()

@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import socket
+import subprocess
 import sys
 import time
 from collections.abc import Iterator
@@ -20,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from localmcp.sandbox import CommandResult, RootAccess, SandboxProfile, SandboxRoot
-from localmcp.sandbox.seatbelt import MacOSSandbox
+from localmcp.sandbox.seatbelt import MacOSSandbox, _developer_directory, _developer_installation
 
 _SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 _SEATBELT_AVAILABLE = sys.platform == "darwin" and _SANDBOX_EXEC.is_file()
@@ -44,7 +45,9 @@ class Workspace:
     read_only: Path
     outside: Path
 
-    def profile(self, *, denied_paths: tuple[Path, ...] = (), network: bool = False) -> SandboxProfile:
+    def profile(
+        self, *, denied_paths: tuple[Path, ...] = (), network: bool = False, dev_tools: bool = False
+    ) -> SandboxProfile:
         return SandboxProfile(
             roots=(
                 SandboxRoot(self.read_write, RootAccess.READ_WRITE),
@@ -52,6 +55,7 @@ class Workspace:
             ),
             denied_paths=denied_paths,
             network=network,
+            dev_tools=dev_tools,
         )
 
 
@@ -356,13 +360,131 @@ async def test_caller_environment_is_not_inherited(workspace: Workspace, monkeyp
     assert environment["TMPDIR"] == str(workspace.read_write)
 
 
-@pytest.mark.skipif(shutil.which("git") is None, reason="git not on PATH")
-async def test_git_works_inside_read_write_root(workspace: Workspace) -> None:
-    result = await _run(workspace.profile(), "git init -q && git status --porcelain=v1 --branch")
+# Developer tools
+
+# The /usr/bin shims re-resolve the toolchain on every call, which is slow under the sandbox.
+_TOOLCHAIN_TIMEOUT_SECONDS = 30
+
+
+def _selected_developer() -> Path | None:
+    return _developer_directory(os.environ.get("DEVELOPER_DIR"))
+
+
+@pytest.fixture
+def developer() -> Path:
+    selected = _selected_developer()
+    if selected is None:
+        pytest.skip("no Xcode or Command Line Tools selected")
+    return selected
+
+
+@pytest.fixture(params=["host-path", "shim-only-path"])
+def git_path(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Run git tests with the caller's PATH, and with only the /usr/bin shim on PATH."""
+    if request.param == "shim-only-path":
+        if _selected_developer() is None:
+            pytest.skip("no Xcode or Command Line Tools selected")
+        monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    elif shutil.which("git") is None:
+        pytest.skip("git not on PATH")
+    return str(request.param)
+
+
+def _host_git(cwd: Path, *args: str) -> None:
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(cwd),
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    if "DEVELOPER_DIR" in os.environ:
+        environment["DEVELOPER_DIR"] = os.environ["DEVELOPER_DIR"]
+    subprocess.run(
+        ["git", "-c", "user.email=t@e.st", "-c", "user.name=Tester", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        env=environment,
+    )
+
+
+@pytest.fixture
+def seeded_repository(workspace: Workspace) -> Path:
+    """A one-commit repository in the read-only root."""
+    (workspace.read_only / "file.txt").write_text("first\nsecond\n")
+    _host_git(workspace.read_only, "init", "-q")
+    _host_git(workspace.read_only, "add", "file.txt")
+    _host_git(workspace.read_only, "commit", "-qm", "seed")
+    return workspace.read_only
+
+
+async def test_git_works_inside_read_write_root(workspace: Workspace, git_path: str) -> None:
+    result = await _run(
+        workspace.profile(dev_tools=True),
+        "git init -q && git status --porcelain=v1 --branch",
+        timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
+    )
 
     assert result.exit_code == 0, result
     assert result.stdout.startswith("## ")
     assert (workspace.read_write / ".git" / "HEAD").is_file()
+
+
+async def test_git_reads_history_in_read_only_root(
+    workspace: Workspace, seeded_repository: Path, git_path: str
+) -> None:
+    result = await _run(
+        workspace.profile(dev_tools=True),
+        f"cd {seeded_repository} && git log --oneline && git blame file.txt",
+        timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
+    )
+
+    assert result.exit_code == 0, result
+    assert "seed" in result.stdout
+    assert "first" in result.stdout and "second" in result.stdout
+
+
+async def test_git_dispatches_exec_helpers(workspace: Workspace, seeded_repository: Path, git_path: str) -> None:
+    # file:// transport execs git-upload-pack from git's exec path, not from PATH.
+    result = await _run(
+        workspace.profile(dev_tools=True),
+        f"git ls-remote file://{seeded_repository} && git clone -q file://{seeded_repository} clone",
+        timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
+    )
+
+    assert result.exit_code == 0, result
+    assert "HEAD" in result.stdout
+    assert (workspace.read_write / "clone" / "file.txt").read_text() == "first\nsecond\n"
+
+
+async def test_dev_tools_runs_toolchain_python_through_the_shim(workspace: Workspace, developer: Path) -> None:
+    if not (developer / "usr" / "bin" / "python3").is_file():
+        pytest.skip("selected developer directory has no python3")
+
+    result = await _run(
+        workspace.profile(dev_tools=True),
+        "/usr/bin/python3 -c 'import json, sqlite3; print(json.dumps(sqlite3.sqlite_version_info[0]))'",
+        timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
+    )
+
+    assert result.exit_code == 0, result
+    assert result.stdout.strip() == "3"
+
+
+async def test_dev_tools_grants_no_writes_to_the_toolchain(workspace: Workspace, developer: Path) -> None:
+    target = _developer_installation(developer) / f"localmcp-seatbelt-{os.getpid()}-{time.monotonic_ns()}"
+
+    result = await _run(workspace.profile(dev_tools=True), f"printf nope > {target}")
+
+    _assert_denied(result)
+    assert not target.exists()
+
+
+async def test_toolchain_is_unreadable_without_dev_tools(workspace: Workspace, developer: Path) -> None:
+    result = await _run(workspace.profile(), f"ls {developer / 'usr' / 'bin'}")
+
+    _assert_denied(result)
+    assert result.stdout == ""
 
 
 # Resource limits

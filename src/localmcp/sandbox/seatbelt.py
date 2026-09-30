@@ -9,7 +9,6 @@ import shutil
 import signal
 import subprocess
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol
@@ -136,85 +135,85 @@ def _runtime_read_directories(paths: tuple[Path, ...]) -> tuple[Path, ...]:
     return tuple(sorted(directories, key=os.fspath))
 
 
-@dataclass(frozen=True)
-class _Utility:
-    """A command the sandbox exposes, plus where it dispatches its exec helpers.
+# Xcode records license acceptance here; the /usr/bin shims refuse to run without reading it.
+_XCODE_LICENSE = Path("/Library/Preferences/com.apple.dt.Xcode.plist")
 
-    ``helper_subdir`` is the tool's helper directory relative to ``<bindir>/..`` (git
-    re-execs subcommands from ``libexec/git-core``); it is empty for tools with none.
+
+@lru_cache(maxsize=4)
+def _developer_directory(developer_dir: str | None) -> Path | None:
+    """Return the selected developer directory, or ``None`` when none is usable.
+
+    ``developer_dir`` is the caller's ``DEVELOPER_DIR`` (part of the cache key, so changing
+    it is honored). Otherwise the selection comes from ``xcode-select -p``. Neither can
+    raise the Command Line Tools install prompt, unlike ``xcrun`` or a ``/usr/bin`` shim.
     """
-
-    name: str
-    helper_subdir: tuple[str, ...] = ()
-
-
-# Utilities exposed inside the sandbox. Adding one is a data row, not new code: resolution
-# (including bypassing any /usr/bin libxcselect shim) and helper-dir wiring are generic below.
-_UTILITIES: tuple[_Utility, ...] = (
-    _Utility("rg"),
-    _Utility("git", helper_subdir=("libexec", "git-core")),
-)
-
-
-def _resolve_executable(candidate: str | os.PathLike[str] | None) -> Path | None:
-    if not candidate:
+    value = developer_dir
+    if not value:
+        try:
+            result = subprocess.run(
+                ["/usr/bin/xcode-select", "-p"], check=False, capture_output=True, text=True, timeout=5
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        value = result.stdout.strip()
+    if not value:
         return None
     try:
-        resolved = Path(candidate).resolve(strict=True)
+        path = Path(value).resolve(strict=True)
     except OSError:
         return None
-    return resolved if resolved.is_file() else None
+    # Like xcrun, accept an Xcode.app bundle path for its Contents/Developer.
+    if path.suffix == ".app" and (path / "Contents" / "Developer").is_dir():
+        path = path / "Contents" / "Developer"
+    return path if (path / "usr" / "bin").is_dir() else None
 
 
-def _resolve_via_xcrun(name: str) -> Path | None:
-    """Locate ``name`` in the active developer directory, past the ``/usr/bin`` shim."""
-    shim = Path("/usr/bin") / name
-    for argv in (["/usr/bin/xcrun", "-f", name], ["/usr/bin/xcode-select", "-p"]):
-        try:
-            result = subprocess.run(argv, check=False, capture_output=True, text=True, timeout=5)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if result.returncode != 0:
-            continue
-        value = result.stdout.strip()
-        if not value:
-            continue
-        candidate = value if argv[1] == "-f" else os.path.join(value, "usr", "bin", name)
-        real = _resolve_executable(candidate)
-        if real is not None and real != shim:
-            return real
-    return None
+def _developer_installation(developer: Path) -> Path:
+    """Return the tree the toolchain reads from: the whole Xcode.app, or the directory itself.
+
+    Inside Xcode.app the shims also read Contents/Info.plist and load Contents/SharedFrameworks,
+    so granting only Contents/Developer is not enough. A Command Line Tools install is self-contained.
+    """
+    bundle = developer.parent.parent
+    if developer.name == "Developer" and developer.parent.name == "Contents" and bundle.suffix == ".app":
+        return bundle
+    return developer
+
+
+def _developer_bin_directories(developer: Path) -> tuple[Path, ...]:
+    """Return the toolchain's own bin directories, so commands skip the slow, noisy /usr/bin shims."""
+    candidates = (
+        developer / "usr" / "bin",
+        developer / "Toolchains" / "XcodeDefault.xctoolchain" / "usr" / "bin",
+    )
+    return tuple(candidate for candidate in candidates if candidate.is_dir())
 
 
 @lru_cache(maxsize=8)
-def _resolve_utility(name: str) -> Path | None:
-    """Resolve a real binary for ``name``, bypassing the ``/usr/bin`` libxcselect shim.
+def _git_exec_path(git: Path) -> Path | None:
+    """Return the helper directory ``git`` reports, unresolved (it can run through symlinks).
 
-    ``/usr/bin/git`` (and its siblings) are not the tools: each reads
-    ``/var/db/xcode_select_link`` and re-execs the toolchain binary under the developer dir.
-    Both reads sit outside the default-deny sandbox, so the shim and every subcommand fail. A
-    copy on PATH elsewhere (e.g. Homebrew) is real and used unchanged; otherwise the binary is
-    located from the active developer directory via ``xcrun``/``xcode-select``. Returns ``None``
-    when only the unusable shim exists, so a tool that cannot run is never advertised. Memoized:
-    a process's toolchain does not change, and probing an unhealthy selection can cost seconds.
+    The /usr/bin shim is never run here: without Command Line Tools it can raise an install prompt.
     """
-    shim = Path("/usr/bin") / name
-    which = _resolve_executable(shutil.which(name))
-    if which is not None and which != shim:
-        return which
-    return _resolve_via_xcrun(name)
-
-
-def _helper_directories(executable: Path | None, helper_subdir: tuple[str, ...]) -> tuple[Path, ...]:
-    """Locate a tool's exec-helper directory (e.g. git's ``libexec/git-core``)."""
-    if executable is None or not helper_subdir:
-        return ()
-    candidate = executable.parent.parent.joinpath(*helper_subdir)
+    if git.is_relative_to("/usr/bin"):
+        return None
     try:
-        resolved = candidate.resolve(strict=True)
-    except OSError:
-        return ()
-    return (resolved,) if resolved.is_dir() else ()
+        result = subprocess.run(
+            [os.fspath(git), "--exec-path"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env={"PATH": "/usr/bin:/bin"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value.startswith("/"):
+        return None
+    return Path(value)
 
 
 def _path_ancestors(paths: tuple[Path, ...]) -> tuple[Path, ...]:
@@ -282,40 +281,57 @@ class MacOSSandbox:
             denied_paths=tuple(denied_paths),
             network=profile.network,
             ipc=profile.ipc,
+            dev_tools=profile.dev_tools,
         )
         self.timeout_seconds = timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.process_label = process_label
         self._sandbox_exec = Path("/usr/bin/sandbox-exec")
         self._shell = Path("/bin/sh")
-        resolved = [
-            (utility, binary) for utility in _UTILITIES if (binary := _resolve_utility(utility.name)) is not None
-        ]
-        self._executables = tuple(binary for _, binary in resolved)
+        executables = {
+            name: Path(value).resolve(strict=True)
+            for name in ("rg", "git")
+            if (value := shutil.which(name)) is not None
+        }
+        self._executables = tuple(executables.values())
         self._runtime_paths = tuple(
             sorted(
                 {path for executable in self._executables for path in _runtime_read_paths(executable)}, key=os.fspath
             )
         )
-        # Tools like git dispatch subcommands by exec'ing helpers under a sibling directory
-        # (git: libexec/git-core); those need read + exec-map, granted separately from the
-        # runtime dylib directories below.
-        self._helper_directories = tuple(
-            sorted(
-                {
-                    directory
-                    for utility, binary in resolved
-                    for directory in _helper_directories(binary, utility.helper_subdir)
-                },
-                key=os.fspath,
-            )
-        )
         self._runtime_directories = _runtime_read_directories(self._runtime_paths)
+        # git dispatches subcommands (clone, ls-remote, ...) by exec'ing helpers from its exec
+        # path, which can sit behind a symlink (Homebrew's opt/git); metadata on the unresolved
+        # path lets the kernel follow it, and the resolved directory needs read + exec-map.
+        git_exec_path = _git_exec_path(executables["git"]) if "git" in executables else None
+        self._helper_directories: tuple[Path, ...] = ()
+        if git_exec_path is not None:
+            try:
+                self._helper_directories = (git_exec_path.resolve(strict=True),)
+            except OSError:
+                git_exec_path = None
+        self._developer = _developer_directory(os.environ.get("DEVELOPER_DIR")) if profile.dev_tools else None
+        self._developer_installation: Path | None = None
+        self._developer_preferences: tuple[Path, ...] = ()
+        if self._developer is not None:
+            installation = _developer_installation(self._developer)
+            if any(
+                installation.is_relative_to(root.path) or root.path.is_relative_to(installation) for root in self.roots
+            ):
+                raise SandboxError(f"developer directory overlaps a sandbox root: {installation}")
+            self._developer_installation = installation
+            if installation != self._developer:
+                self._developer_preferences = (_XCODE_LICENSE,)
         self._process_limit = _owned_process_limit()
         # Grant metadata reads along the resolved toolchain paths so deep developer-dir
         # installs (e.g. inside Xcode.app) stay traversable without opening whole trees.
         self._metadata_ancestors = _path_ancestors(
-            tuple(root.path for root in self.roots) + self._executables + self._helper_directories
+            tuple(root.path for root in self.roots)
+            + self._executables
+            + self._helper_directories
+            + ((git_exec_path,) if git_exec_path is not None else ())
+            + ((self._developer_installation,) if self._developer_installation is not None else ())
+            + self._developer_preferences
         )
         # Renaming a denied path, or any directory above it inside a root,
         # would move its contents out from under the read denial.
@@ -362,6 +378,13 @@ class MacOSSandbox:
             value
             for index, path in enumerate(self._helper_directories)
             for value in ("-D", f"HELPER_DIRECTORY_{index}={path}")
+        )
+        if self._developer_installation is not None:
+            runtime_definitions.extend(("-D", f"DEVELOPER_INSTALLATION={self._developer_installation}"))
+        runtime_definitions.extend(
+            value
+            for index, path in enumerate(self._developer_preferences)
+            for value in ("-D", f"DEVELOPER_PREFERENCE_{index}={path}")
         )
         runtime_definitions.extend(
             value
@@ -453,6 +476,12 @@ class MacOSSandbox:
             f'(allow file-read* file-map-executable (subpath (param "HELPER_DIRECTORY_{index}")))\n'
             for index in range(len(self._helper_directories))
         )
+        if self._developer_installation is not None:
+            runtime_profile += '(allow file-read* file-map-executable (subpath (param "DEVELOPER_INSTALLATION")))\n'
+        runtime_profile += "".join(
+            f'(allow file-read* (literal (param "DEVELOPER_PREFERENCE_{index}")))\n'
+            for index in range(len(self._developer_preferences))
+        )
         runtime_profile += "".join(
             f'(allow file-read-metadata (literal (param "METADATA_ANCESTOR_{index}")))\n'
             for index in range(len(self._metadata_ancestors))
@@ -474,10 +503,16 @@ class MacOSSandbox:
 
     def _environment(self) -> dict[str, str]:
         paths = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+        environment: dict[str, str] = {}
+        if self._developer is not None:
+            # Pin the selection the grant was computed for, and put the toolchain ahead of the
+            # /usr/bin shims, which re-resolve it on every call (slow, and noisy in a sandbox).
+            environment["DEVELOPER_DIR"] = os.fspath(self._developer)
+            paths[:0] = [os.fspath(path) for path in _developer_bin_directories(self._developer)]
         for executable in self._executables:
             if executable.parent not in {Path(path) for path in paths}:
                 paths.insert(0, os.fspath(executable.parent))
-        return {
+        return environment | {
             "HOME": "/var/empty",
             "PATH": os.pathsep.join(paths),
             "LC_ALL": "C",

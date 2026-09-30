@@ -41,12 +41,17 @@ class SandboxProfile:
 
     The first root is the process working directory. ``ipc`` permits
     shared-memory IPC only, not sockets or platform service protocols.
+    ``dev_tools`` grants read-only access to the host's selected developer
+    toolchain (on macOS, the active Xcode or Command Line Tools install), so
+    toolchain commands such as ``git``, ``python3``, ``clang`` and ``make``
+    work; backends without such a toolchain ignore it.
     """
 
     roots: tuple[SandboxRoot, ...]
     denied_paths: tuple[Path, ...] = ()
     network: bool = False
     ipc: bool = False
+    dev_tools: bool = False
 
     def __post_init__(self) -> None:
         if not self.roots:

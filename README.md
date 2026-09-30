@@ -154,6 +154,12 @@ roots, a clean environment, output and time limits, process-group cleanup, and
 network access disabled by default. The current implementation uses macOS
 Seatbelt; the portable interface leaves room for a future Linux backend.
 
+On macOS, `git`, `python3`, `clang` and `make` in `/usr/bin` are shims that run
+the selected Xcode or Command Line Tools install, which the sandbox cannot read
+by default. Set `SandboxProfile(..., dev_tools=True)` to grant read-only access
+to that toolchain (plus Xcode's license record) and put it first on the
+sandbox `PATH`. A separately installed git, such as Homebrew's, works without it.
+
 ### Durable workflows
 
 The workflow package supplies LangGraph lifecycle management and a generic
