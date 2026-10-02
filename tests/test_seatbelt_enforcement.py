@@ -8,8 +8,8 @@ a CI job dedicated to enforcement cannot pass with every test skipped.
 
 from __future__ import annotations
 
+import asyncio
 import os
-import shutil
 import socket
 import subprocess
 import sys
@@ -20,8 +20,17 @@ from pathlib import Path
 
 import pytest
 
-from localmcp.sandbox import CommandResult, RootAccess, SandboxProfile, SandboxRoot
-from localmcp.sandbox.seatbelt import MacOSSandbox, _developer_directory, _developer_installation
+from localmcp.sandbox import (
+    INSPECTION_TOOLS,
+    WRITE_TOOLS,
+    CommandResult,
+    RootAccess,
+    SandboxError,
+    SandboxProfile,
+    SandboxRoot,
+    seatbelt,
+)
+from localmcp.sandbox.seatbelt import MacOSSandbox, _developer_directory, _homebrew_prefix, _homebrew_tool
 
 _SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 _SEATBELT_AVAILABLE = sys.platform == "darwin" and _SANDBOX_EXEC.is_file()
@@ -35,6 +44,9 @@ if not _SEATBELT_AVAILABLE:
 pytestmark = pytest.mark.seatbelt
 
 _NC = "/usr/bin/nc"
+_PERL = "/usr/bin/perl"
+# Lets the filesystem tests read, list, link, rename and remove files.
+_TOOLS = (*INSPECTION_TOOLS, *WRITE_TOOLS)
 
 
 @dataclass(frozen=True)
@@ -46,7 +58,12 @@ class Workspace:
     outside: Path
 
     def profile(
-        self, *, denied_paths: tuple[Path, ...] = (), network: bool = False, dev_tools: bool = False
+        self,
+        *,
+        denied_paths: tuple[Path, ...] = (),
+        network: bool = False,
+        tools: tuple[str, ...] = _TOOLS,
+        optional_tools: tuple[str, ...] = (),
     ) -> SandboxProfile:
         return SandboxProfile(
             roots=(
@@ -55,7 +72,8 @@ class Workspace:
             ),
             denied_paths=denied_paths,
             network=network,
-            dev_tools=dev_tools,
+            tools=tools,
+            optional_tools=optional_tools,
         )
 
 
@@ -332,14 +350,14 @@ def listening_port() -> Iterator[int]:
 
 @pytest.mark.skipif(not Path(_NC).is_file(), reason="/usr/bin/nc unavailable")
 async def test_outbound_connection_denied_without_network(workspace: Workspace, listening_port: int) -> None:
-    result = await _run(workspace.profile(network=False), f"{_NC} -n -z -w 2 127.0.0.1 {listening_port}")
+    result = await _run(workspace.profile(network=False, tools=("nc",)), f"{_NC} -n -z -w 2 127.0.0.1 {listening_port}")
 
     _assert_denied(result)
 
 
 @pytest.mark.skipif(not Path(_NC).is_file(), reason="/usr/bin/nc unavailable")
 async def test_outbound_connection_allowed_with_network(workspace: Workspace, listening_port: int) -> None:
-    result = await _run(workspace.profile(network=True), f"{_NC} -n -z -w 2 127.0.0.1 {listening_port}")
+    result = await _run(workspace.profile(network=True, tools=("nc",)), f"{_NC} -n -z -w 2 127.0.0.1 {listening_port}")
 
     assert result.exit_code == 0, result
 
@@ -350,14 +368,94 @@ async def test_outbound_connection_allowed_with_network(workspace: Workspace, li
 async def test_caller_environment_is_not_inherited(workspace: Workspace, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LOCALMCP_TEST_SECRET", "caller-env-sentinel")
 
-    result = await _run(workspace.profile(), "env")
+    result = await _run(workspace.profile(tools=("env",)), "env")
 
     assert result.exit_code == 0, result
     assert "LOCALMCP_TEST_SECRET" not in result.stdout
     assert "caller-env-sentinel" not in result.stdout
     environment = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
     assert environment["HOME"] == "/var/empty"
-    assert environment["TMPDIR"] == str(workspace.read_write)
+    assert environment["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+async def test_each_command_gets_a_private_tmpdir_that_is_removed(workspace: Workspace) -> None:
+    sandbox = MacOSSandbox(workspace.profile())
+    command = 'test ! -e "$TMPDIR/marker" && printf x > "$TMPDIR/marker" && printf %s "$TMPDIR"'
+
+    first = await sandbox.run(command)
+    second = await sandbox.run(command)
+
+    assert first.exit_code == 0, first
+    assert second.exit_code == 0, second
+    assert first.stdout != second.stdout
+    for scratch in (Path(first.stdout), Path(second.stdout)):
+        assert not any(scratch.is_relative_to(root) for root in (workspace.read_write, workspace.read_only))
+        assert not scratch.exists()
+
+
+async def test_tmpdir_is_read_only_without_a_read_write_root(workspace: Workspace) -> None:
+    # Nothing bounds what a command writes, so a read-only profile gets no space to fill.
+    sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(workspace.read_only, RootAccess.READ_ONLY),)))
+
+    result = await sandbox.run('test -d "$TMPDIR" && printf x > "$TMPDIR/marker"')
+
+    _assert_denied(result)
+    assert "Operation not permitted" in result.stderr
+
+
+# Commands
+
+
+async def test_only_builtins_and_listed_tools_run(workspace: Workspace) -> None:
+    (workspace.read_write / "data.txt").write_text("listed\n")
+
+    result = await _run(workspace.profile(tools=("cat",)), "cat data.txt && echo builtin && ls; echo $?")
+
+    assert result.exit_code == 0, result
+    assert result.stdout == "listed\nbuiltin\n126\n"
+    assert "/bin/ls: Operation not permitted" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("awk 'BEGIN { exit system(\"/bin/ls /\") }'", id="awk"),
+        pytest.param("find / -maxdepth 0 -exec /bin/ls {} +", id="find"),
+        pytest.param("echo / | xargs /bin/ls", id="xargs"),
+    ],
+)
+async def test_listed_tools_cannot_run_unlisted_commands(workspace: Workspace, command: str) -> None:
+    result = await _run(workspace.profile(tools=("awk", "find", "xargs")), command)
+
+    _assert_denied(result, leaked="Library")
+    assert "Operation not permitted" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("cp /bin/ls copy && ./copy /", id="copied-binary"),
+        pytest.param("printf '#!/bin/sh\\necho ran\\n' > script && chmod +x script && ./script", id="written-script"),
+    ],
+)
+async def test_programs_in_a_read_write_root_cannot_run(workspace: Workspace, command: str) -> None:
+    result = await _run(workspace.profile(tools=("chmod", "cp")), command)
+
+    _assert_denied(result, leaked="ran")
+    assert "Library" not in result.stdout
+    assert "Operation not permitted" in result.stderr
+
+
+async def test_script_tools_run_their_interpreter_only_for_themselves(workspace: Workspace) -> None:
+    shasum = Path("/usr/bin/shasum")
+    if not shasum.is_file() or not shasum.read_bytes().startswith(b"#!/usr/bin/perl"):
+        pytest.skip("/usr/bin/shasum is not a perl script")
+
+    result = await _run(workspace.profile(tools=("shasum",)), "printf x | shasum && perl -e 'print qq(ran)'")
+
+    assert result.exit_code == 126, result
+    assert result.stdout == "11f6ad8ec52a2984abaafd7c3b516503785c2072  -\n"
+    assert "/usr/bin/perl: Operation not permitted" in result.stderr
 
 
 # Developer tools
@@ -366,28 +464,39 @@ async def test_caller_environment_is_not_inherited(workspace: Workspace, monkeyp
 _TOOLCHAIN_TIMEOUT_SECONDS = 30
 
 
-def _selected_developer() -> Path | None:
-    return _developer_directory(os.environ.get("DEVELOPER_DIR"))
+def _homebrew_tool_or_skip(*candidates: str) -> tuple[Path, str]:
+    """Return the Homebrew prefix and the first candidate it installs as a formula tool."""
+    prefix = _homebrew_prefix()
+    if prefix is None:
+        pytest.skip("Homebrew not installed")
+    for tool in candidates:
+        if _homebrew_tool(prefix, tool) is not None:
+            return prefix, tool
+    pytest.skip(f"Homebrew installs none of {candidates}")
 
 
 @pytest.fixture
-def developer() -> Path:
-    selected = _selected_developer()
+def developer(monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The selected Xcode or Command Line Tools install, with Homebrew hidden so it serves every tool."""
+    selected = _developer_directory()
     if selected is None:
         pytest.skip("no Xcode or Command Line Tools selected")
+    monkeypatch.setattr(seatbelt, "_HOMEBREW_PREFIXES", ())
     return selected
 
 
-@pytest.fixture(params=["host-path", "shim-only-path"])
-def git_path(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
-    """Run git tests with the caller's PATH, and with only the /usr/bin shim on PATH."""
-    if request.param == "shim-only-path":
-        if _selected_developer() is None:
-            pytest.skip("no Xcode or Command Line Tools selected")
-        monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-    elif shutil.which("git") is None:
-        pytest.skip("git not on PATH")
-    return str(request.param)
+@pytest.fixture(params=["homebrew", "developer"])
+def git_bin(request: pytest.FixtureRequest) -> Path:
+    """Run git tests with Homebrew's git, then with the developer toolchain's.
+
+    Returns the directory the sandbox is expected to run git from.
+    """
+    if request.param == "homebrew":
+        prefix, tool = _homebrew_tool_or_skip("git")
+        return (prefix / "bin" / tool).resolve().parent
+    selected = request.getfixturevalue("developer")
+    assert isinstance(selected, Path)
+    return selected / "usr" / "bin"
 
 
 def _host_git(cwd: Path, *args: str) -> None:
@@ -418,23 +527,25 @@ def seeded_repository(workspace: Workspace) -> Path:
     return workspace.read_only
 
 
-async def test_git_works_inside_read_write_root(workspace: Workspace, git_path: str) -> None:
+async def test_git_works_inside_read_write_root(workspace: Workspace, git_bin: Path) -> None:
     result = await _run(
-        workspace.profile(dev_tools=True),
-        "git init -q && git status --porcelain=v1 --branch",
+        workspace.profile(tools=("git",)),
+        "command -v git && git init -q && git status --porcelain=v1 --branch",
         timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
     )
 
     assert result.exit_code == 0, result
-    assert result.stdout.startswith("## ")
+    located, status = result.stdout.split("\n", 1)
+    assert Path(located) == git_bin / "git"
+    assert status.startswith("## ")
     assert (workspace.read_write / ".git" / "HEAD").is_file()
 
 
 async def test_git_reads_history_in_read_only_root(
-    workspace: Workspace, seeded_repository: Path, git_path: str
+    workspace: Workspace, seeded_repository: Path, git_bin: Path
 ) -> None:
     result = await _run(
-        workspace.profile(dev_tools=True),
+        workspace.profile(tools=("git",)),
         f"cd {seeded_repository} && git log --oneline && git blame file.txt",
         timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
     )
@@ -444,47 +555,193 @@ async def test_git_reads_history_in_read_only_root(
     assert "first" in result.stdout and "second" in result.stdout
 
 
-async def test_git_dispatches_exec_helpers(workspace: Workspace, seeded_repository: Path, git_path: str) -> None:
-    # file:// transport execs git-upload-pack from git's exec path, not from PATH.
+async def test_git_dispatches_exec_helpers(workspace: Workspace, seeded_repository: Path, git_bin: Path) -> None:
+    # git finds these in its exec path (git-core), never on PATH: file:// transport execs
+    # git-upload-pack, and request-pull is a script that exists only there.
     result = await _run(
-        workspace.profile(dev_tools=True),
-        f"git ls-remote file://{seeded_repository} && git clone -q file://{seeded_repository} clone",
+        workspace.profile(tools=("git",)),
+        f"git ls-remote file://{seeded_repository} && git clone -q file://{seeded_repository} clone"
+        " && { git request-pull 2>&1; true; }",
         timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
     )
 
     assert result.exit_code == 0, result
     assert "HEAD" in result.stdout
     assert (workspace.read_write / "clone" / "file.txt").read_text() == "first\nsecond\n"
+    assert "is not a git command" not in result.stdout
+    assert "not a git repository" in result.stdout
 
 
-async def test_dev_tools_runs_toolchain_python_through_the_shim(workspace: Workspace, developer: Path) -> None:
+async def test_tools_ignore_tools_planted_on_the_caller_path(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    planted = workspace.read_only / "bin"
+    planted.mkdir()
+    (planted / "git").write_text("#!/bin/sh\necho planted\n")
+    (planted / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{planted}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}")
+
+    result = await _run(workspace.profile(tools=("git",)), 'command -v git; printf %s "$PATH"')
+
+    assert result.exit_code == 0, result
+    assert str(planted) not in result.stdout
+
+
+@pytest.mark.parametrize("decoy", ["homebrew", "developer"])
+async def test_caller_environment_cannot_widen_tool_grants(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch, decoy: str
+) -> None:
+    # A git install outside every root, selected the way a caller's environment would select it.
+    if decoy == "homebrew":
+        prefix = workspace.outside / "homebrew"
+        install = prefix / "Cellar" / "git" / "1.0"
+        (prefix / "bin").mkdir(parents=True)
+        (prefix / "bin" / "brew").write_text("#!/bin/sh\n")
+        (prefix / "bin" / "brew").chmod(0o755)
+        (prefix / "bin" / "git").symlink_to(install / "bin" / "git")
+        (install / "bin").mkdir(parents=True)
+        (install / "INSTALL_RECEIPT.json").write_text("{}")
+        monkeypatch.setenv("HOMEBREW_PREFIX", str(prefix))
+    else:
+        install = workspace.outside / "Developer"
+        (install / "usr" / "bin").mkdir(parents=True)
+        monkeypatch.setenv("DEVELOPER_DIR", str(install))
+        # Let the developer directory serve git, looked up afresh rather than from the cache.
+        monkeypatch.setattr(seatbelt, "_HOMEBREW_PREFIXES", ())
+        monkeypatch.setattr(seatbelt, "_developer_directory", _developer_directory.__wrapped__)
+    decoy_git = install / "bin" / "git" if decoy == "homebrew" else install / "usr" / "bin" / "git"
+    decoy_git.write_text("#!/bin/sh\necho decoy\n")
+    decoy_git.chmod(0o755)
+    (install / "canary.txt").write_text("canary\n")
+
+    sandbox = MacOSSandbox(workspace.profile(tools=("cat", "git")))
+    result = await sandbox.run(f"command -v git; cat {install / 'canary.txt'} 2>/dev/null; true")
+
+    assert result.exit_code == 0, result
+    assert not any(tree.is_relative_to(workspace.outside) for tree in sandbox._toolchain_trees)
+    assert str(workspace.outside) not in result.stdout
+    assert "canary" not in result.stdout
+
+
+async def test_tools_expose_only_their_own_homebrew_formulae(workspace: Workspace) -> None:
+    prefix, tool = _homebrew_tool_or_skip("rg", "git")
+    sandbox = MacOSSandbox(workspace.profile(tools=("ls", tool)))
+    granted = set(sandbox._toolchain_trees)
+    others = sorted(
+        version
+        for formula in (prefix / "Cellar").iterdir()
+        for version in formula.iterdir()
+        if version.is_dir() and version.resolve() not in granted
+    )
+    hidden = [prefix / name for name in ("bin", "opt", "Cellar", "lib", "share", "etc", "var", "Library")]
+    hidden += [path for path in (prefix / "share" / "man", prefix / "etc" / "openssl@3", *others[:5]) if path.exists()]
+    probes = [f"{tool} --version >/dev/null && echo ran"]
+    probes.extend(f"ls {path} >/dev/null 2>&1 && echo readable:{path}" for path in hidden)
+
+    result = await sandbox.run("; ".join(probes) + "; true")
+
+    assert result.exit_code == 0, result
+    assert result.stdout.startswith("ran\n")
+    assert "readable:" not in result.stdout
+
+
+async def test_installed_optional_tools_run_beside_missing_ones(workspace: Workspace, git_bin: Path) -> None:
+    sandbox = MacOSSandbox(
+        workspace.profile(tools=(), optional_tools=("localmcp-absent-tool", "git")),
+        timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
+    )
+
+    result = await sandbox.run("command -v git && git --version")
+
+    assert sandbox.tools == ("git",)
+    assert result.exit_code == 0, result
+    located, version = result.stdout.split("\n", 1)
+    assert Path(located) == git_bin / "git"
+    assert version.startswith("git version ")
+
+
+async def test_developer_tools_cannot_run_each_others_helpers(workspace: Workspace, developer: Path) -> None:
+    daemon = developer / "usr" / "libexec" / "git-core" / "git-daemon"
+    if not (developer / "usr" / "bin" / "clang").is_file() or not daemon.is_file():
+        pytest.skip("selected developer directory has no clang or git-daemon")
+
+    result = await _run(
+        workspace.profile(tools=("clang",)), f"{daemon} --version", timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS
+    )
+
+    _assert_denied(result)
+    assert f"{daemon}: Operation not permitted" in result.stderr
+
+
+async def test_shims_are_not_tools_without_a_developer_install(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not Path("/usr/bin/git").is_file():
+        pytest.skip("/usr/bin/git unavailable")
+    monkeypatch.setattr(seatbelt, "_HOMEBREW_PREFIXES", ())
+    monkeypatch.setattr(seatbelt, "_developer_directory", lambda: None)
+
+    sandbox = MacOSSandbox(workspace.profile(tools=(), optional_tools=("git",)))
+
+    assert sandbox.tools == ()
+
+
+async def test_tools_run_toolchain_python_through_the_shim(workspace: Workspace, developer: Path) -> None:
     if not (developer / "usr" / "bin" / "python3").is_file():
         pytest.skip("selected developer directory has no python3")
 
     result = await _run(
-        workspace.profile(dev_tools=True),
+        workspace.profile(tools=("python3",)),
         "/usr/bin/python3 -c 'import json, sqlite3; print(json.dumps(sqlite3.sqlite_version_info[0]))'",
         timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
     )
 
     assert result.exit_code == 0, result
     assert result.stdout.strip() == "3"
+    # The shim's libxcrun caches lookups in TMPDIR and reports when it cannot.
+    assert "xcrun" not in result.stderr
 
 
-async def test_dev_tools_grants_no_writes_to_the_toolchain(workspace: Workspace, developer: Path) -> None:
-    target = _developer_installation(developer) / f"localmcp-seatbelt-{os.getpid()}-{time.monotonic_ns()}"
+def _granting_tools() -> tuple[str, ...]:
+    """Return the tools whose installed code is outside the base system on this host."""
+    tools = []
+    for tool in ("git", "rg", "clang"):
+        try:
+            if MacOSSandbox(SandboxProfile((SandboxRoot(Path("/var/empty")),), tools=(tool,)))._toolchain_trees:
+                tools.append(tool)
+        except SandboxError:
+            continue
+    if not tools:
+        pytest.skip("no developer tools installed")
+    return tuple(tools)
 
-    result = await _run(workspace.profile(dev_tools=True), f"printf nope > {target}")
 
-    _assert_denied(result)
-    assert not target.exists()
+async def test_tools_grant_no_writes_to_the_toolchains(workspace: Workspace) -> None:
+    sandbox = MacOSSandbox(workspace.profile(tools=_granting_tools()))
+    marker = f"localmcp-seatbelt-{os.getpid()}-{time.monotonic_ns()}"
+    targets = [tree / marker for tree in sandbox._toolchain_trees]
+
+    try:
+        result = await sandbox.run("; ".join(f"printf nope > {target}" for target in targets))
+    finally:
+        leaked = [target for target in targets if target.exists()]
+        for target in leaked:
+            target.unlink()
+
+    assert not result.timed_out
+    assert leaked == []
 
 
-async def test_toolchain_is_unreadable_without_dev_tools(workspace: Workspace, developer: Path) -> None:
-    result = await _run(workspace.profile(), f"ls {developer / 'usr' / 'bin'}")
+async def test_toolchains_are_unreadable_without_tools(workspace: Workspace) -> None:
+    trees = MacOSSandbox(workspace.profile(tools=_granting_tools()))._toolchain_trees
 
-    _assert_denied(result)
-    assert result.stdout == ""
+    result = await _run(
+        workspace.profile(tools=("ls",)),
+        "; ".join(f"ls {tree} >/dev/null 2>&1 && echo readable:{tree}" for tree in trees) + "; true",
+    )
+
+    assert result.exit_code == 0, result
+    assert "readable:" not in result.stdout
 
 
 # Resource limits
@@ -493,7 +750,7 @@ async def test_toolchain_is_unreadable_without_dev_tools(workspace: Workspace, d
 async def test_long_running_command_times_out_promptly(workspace: Workspace) -> None:
     started = time.monotonic()
 
-    result = await _run(workspace.profile(), "sleep 30", timeout_seconds=1)
+    result = await _run(workspace.profile(tools=("sleep",)), "sleep 30", timeout_seconds=1)
 
     elapsed = time.monotonic() - started
     assert result.timed_out is True
@@ -505,10 +762,73 @@ async def test_long_running_command_times_out_promptly(workspace: Workspace) -> 
 async def test_excess_output_is_truncated_to_limit(workspace: Workspace) -> None:
     limit = 4096
 
-    result = await _run(workspace.profile(), "yes localmcp | head -c 1000000", max_output_bytes=limit)
+    result = await _run(
+        workspace.profile(tools=("head", "yes")), "yes localmcp | head -c 1000000", max_output_bytes=limit
+    )
 
     assert result.truncated is True
     assert result.exit_code == -1
     assert len(result.stdout.encode()) == limit
     assert result.stdout == ("localmcp\n" * limit)[:limit]
     assert "command output exceeded its bounded safety limit" in result.stderr
+
+
+# Process supervision
+
+# Leaves a grandchild in its own session with its output streams closed, so neither the process group nor the
+# pipes tie it to the command. It records that it started, then acts after the command has returned.
+_DETACHED = (
+    f"{_PERL} -e 'use POSIX; exit if fork; POSIX::setsid(); exit if fork; close STDIN; close STDOUT; close STDERR;"
+    ' open my $f, ">", "started"; close $f; sleep 1; open $f, ">", "late"; close $f\';'
+    " while [ ! -e started ]; do sleep 0.05; done"
+)
+_BACKGROUND = "(sleep 1; touch late) >/dev/null 2>&1 & touch started"
+_SUPERVISION_TOOLS = ("perl", "seq", "sleep", "touch")
+
+
+@pytest.mark.skipif(not Path(_PERL).is_file(), reason="/usr/bin/perl unavailable")
+@pytest.mark.parametrize(
+    ("command", "timed_out"),
+    [(_DETACHED, False), (_DETACHED + "; sleep 30", True), (_BACKGROUND, False)],
+    ids=["detached-after-exit", "detached-after-timeout", "background-after-exit"],
+)
+async def test_descendants_cannot_act_after_the_command_returns(
+    workspace: Workspace, command: str, timed_out: bool
+) -> None:
+    result = await _run(workspace.profile(tools=_SUPERVISION_TOOLS), command, timeout_seconds=1)
+    await asyncio.sleep(2)
+
+    assert result.timed_out is timed_out, result
+    assert (workspace.read_write / "started").exists()
+    assert not (workspace.read_write / "late").exists()
+
+
+async def test_supervision_spares_concurrent_commands_with_the_same_profile(workspace: Workspace) -> None:
+    sandbox = MacOSSandbox(workspace.profile(tools=_SUPERVISION_TOOLS), timeout_seconds=10)
+    running = asyncio.create_task(sandbox.run("sleep 1.5; echo survived"))
+    await asyncio.sleep(0.3)
+
+    for _ in range(2):
+        assert (await sandbox.run("true")).exit_code == 0
+    result = await running
+
+    assert result.exit_code == 0, result
+    assert result.stdout == "survived\n"
+
+
+@pytest.mark.skipif(not Path(_PERL).is_file(), reason="/usr/bin/perl unavailable")
+async def test_detached_fork_storm_is_stopped_at_the_timeout(workspace: Workspace) -> None:
+    storm = (
+        "for i in $(seq 1 40); do"
+        f' ( {_PERL} -e \'use POSIX; POSIX::setsid(); fork; fork; sleep 2; open my $f, ">", "late"\' & );'
+        " done; sleep 30"
+    )
+    started = time.monotonic()
+
+    result = await _run(workspace.profile(tools=_SUPERVISION_TOOLS), storm, timeout_seconds=1)
+    elapsed = time.monotonic() - started
+    await asyncio.sleep(2.5)
+
+    assert result.timed_out is True, result
+    assert elapsed < 10
+    assert not (workspace.read_write / "late").exists()
