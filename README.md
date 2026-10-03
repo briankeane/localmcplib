@@ -211,7 +211,9 @@ through `xcode-select`. Neither `HOMEBREW_PREFIX`, `DEVELOPER_DIR` nor the
 caller's `PATH` is consulted, so the caller's environment cannot widen these
 grants, and tools installed elsewhere, such as under `~/.cargo/bin`, are not
 available. Configuration a tool reads from outside its own install, such as
-Homebrew OpenSSL's `etc/openssl@3`, is not granted either.
+Homebrew OpenSSL's `etc/openssl@3`, is not granted either. The exception is a
+profile with `network`, which also grants the system TLS configuration and
+trust store in `/etc/ssl`, without which the system `curl` cannot start.
 
 ### Durable workflows
 

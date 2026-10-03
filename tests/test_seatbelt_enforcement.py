@@ -9,10 +9,12 @@ a CI job dedicated to enforcement cannot pass with every test skipped.
 from __future__ import annotations
 
 import asyncio
+import http.server
 import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -43,6 +45,7 @@ if not _SEATBELT_AVAILABLE:
 
 pytestmark = pytest.mark.seatbelt
 
+_CURL = "/usr/bin/curl"
 _NC = "/usr/bin/nc"
 _PERL = "/usr/bin/perl"
 # Lets the filesystem tests read, list, link, rename and remove files.
@@ -402,6 +405,53 @@ async def test_outbound_connection_allowed_with_network(workspace: Workspace, li
     result = await _run(workspace.profile(network=True, tools=("nc",)), f"{_NC} -n -z -w 2 127.0.0.1 {listening_port}")
 
     assert result.exit_code == 0, result
+
+
+class _OkHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+
+@pytest.fixture
+def http_port() -> Iterator[int]:
+    """A loopback HTTP server answering every request with an empty 200."""
+    with http.server.ThreadingHTTPServer(("127.0.0.1", 0), _OkHandler) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield server.server_address[1]
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+@pytest.mark.skipif(not Path(_CURL).is_file(), reason="/usr/bin/curl unavailable")
+async def test_system_curl_works_with_network(workspace: Workspace, http_port: int) -> None:
+    result = await _run(
+        workspace.profile(network=True, tools=("curl",)),
+        f"curl -sS -o /dev/null -w '%{{http_code}}' http://127.0.0.1:{http_port}/",
+    )
+
+    assert result.exit_code == 0, result
+    assert result.stdout == "200"
+
+
+@pytest.mark.parametrize("network", [False, True], ids=["offline", "online"])
+async def test_system_trust_store_is_readable_only_with_network(workspace: Workspace, network: bool) -> None:
+    result = await _run(
+        workspace.profile(network=network, tools=("grep",)), "grep -c 'BEGIN CERTIFICATE' /etc/ssl/cert.pem"
+    )
+
+    if network:
+        assert result.exit_code == 0, result
+        assert int(result.stdout) > 0
+    else:
+        _assert_denied(result)
 
 
 # Environment

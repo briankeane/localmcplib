@@ -62,7 +62,11 @@ _BASE_PROFILE = """\
     (subpath "/Library/Apple")
     (subpath "/private/var/select"))
 """
-_NETWORK_PROFILE = "(allow network-outbound)\n"
+# The system TLS library, which curl uses, needs its configuration and trust store to start.
+_NETWORK_PROFILE = """\
+(allow network-outbound)
+(allow file-read* (literal "/private/etc/ssl/openssl.cnf") (literal "/private/etc/ssl/cert.pem"))
+"""
 _SHARED_MEMORY_IPC_PROFILE = "(allow ipc-posix-shm ipc-sysv-shm)\n"
 
 
