@@ -206,6 +206,75 @@ def test_constructor_rejects_unsafe_limits_and_labels(tmp_path: Path, kwargs: di
         MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path),)), **kwargs)
 
 
+@pytest.mark.parametrize("denied", ["credentials", "private"])
+def test_denied_files_with_other_hard_links_fail_closed(tmp_path: Path, denied: str) -> None:
+    (tmp_path / "private" / "nested").mkdir(parents=True)
+    (tmp_path / "credentials").write_text("secret")
+    (tmp_path / "private" / "nested" / "key").write_text("secret")
+    (tmp_path / "private" / "link").symlink_to(tmp_path / "credentials")
+    profile = SandboxProfile((SandboxRoot(tmp_path),), denied_paths=(tmp_path / denied, tmp_path / "missing"))
+    MacOSSandbox(profile)
+
+    linked = tmp_path / "credentials" if denied == "credentials" else tmp_path / "private" / "nested" / "key"
+    os.link(linked, tmp_path / "alias")
+
+    with pytest.raises(SandboxError, match=re.escape(f"another hard link and cannot be enforced: {linked}")):
+        MacOSSandbox(profile)
+
+
+@_unprivileged
+@pytest.mark.parametrize(
+    ("mode", "unchecked"), [(0o000, "locked"), (0o600, "locked/key")], ids=["unlistable", "unsearchable"]
+)
+def test_denied_paths_that_cannot_be_checked_fail_closed(tmp_path: Path, mode: int, unchecked: str) -> None:
+    locked = tmp_path / "private" / "locked"
+    locked.mkdir(parents=True)
+    (locked / "key").write_text("secret")
+    locked.chmod(mode)
+    try:
+        with pytest.raises(
+            SandboxError, match=re.escape(f"cannot be checked for hard links: {locked.parent / unchecked}")
+        ):
+            MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path),), denied_paths=(tmp_path / "private",)))
+    finally:
+        locked.chmod(0o755)
+
+
+@pytest.mark.parametrize("denied", ["link/key", "alias"])
+def test_denied_paths_through_symlinks_fail_closed(tmp_path: Path, denied: str) -> None:
+    # Seatbelt matches the real path a file is opened by, so these would deny nothing.
+    (tmp_path / "real").mkdir()
+    (tmp_path / "real" / "key").write_text("secret")
+    (tmp_path / "link").symlink_to(tmp_path / "real")
+    (tmp_path / "alias").symlink_to(tmp_path / "real" / "key")
+
+    with pytest.raises(
+        SandboxError, match=re.escape(f"goes through a symlink and cannot be enforced: {tmp_path / denied}")
+    ):
+        MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path),), denied_paths=(tmp_path / denied,)))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("change", "message"), [("link", "another hard link"), ("replace", "goes through a symlink")])
+async def test_commands_fail_closed_on_denied_paths_changed_after_the_sandbox(
+    tmp_path: Path, change: str, message: str
+) -> None:
+    denied = tmp_path / "private" / "credentials"
+    denied.parent.mkdir()
+    denied.write_text("secret")
+    sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path),), denied_paths=(denied,)))
+    sandbox._sandbox_exec = tmp_path / "sandbox-exec"
+    sandbox._sandbox_exec.touch()
+    if change == "link":
+        os.link(denied, tmp_path / "alias")
+    else:
+        denied.parent.rename(tmp_path / "moved")
+        denied.parent.symlink_to(tmp_path / "moved")
+
+    with pytest.raises(SandboxError, match=message):
+        await sandbox._execute(["/bin/sh", "-c", "true"])
+
+
 @pytest.mark.parametrize("location", ["", "nested", "private"], ids=["root", "inside-root", "inside-denied-path"])
 def test_scratch_must_be_outside_every_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, location: str) -> None:
     # Cleanup finds a command's processes by their access to its scratch, which a root or denial would change.

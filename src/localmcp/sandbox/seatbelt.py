@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import signal
+import stat
 import subprocess
 import tempfile
 from collections.abc import Awaitable, Callable
@@ -424,6 +425,36 @@ def _tool_grants(tools: tuple[str, ...], optional_tools: tuple[str, ...] = ()) -
     )
 
 
+def _uncheckable(error: OSError) -> None:
+    """Fail on an error checking a denied path, unless its file is gone and so has no other name."""
+    if not isinstance(error, FileNotFoundError):
+        raise SandboxError(f"sandbox denied path cannot be checked for hard links: {error.filename}") from error
+
+
+def _check_denied_paths(denied_paths: tuple[Path, ...]) -> None:
+    """Fail unless Seatbelt can deny each denied path's files under every name.
+
+    Seatbelt denies the real path a file is opened by. A denied path through a symlink
+    denies nothing, and a denied file with another hard link stays readable under that name.
+    """
+    for denied in denied_paths:
+        if Path(os.path.realpath(denied)) != denied:
+            raise SandboxError(f"sandbox denied path goes through a symlink and cannot be enforced: {denied}")
+        names = [denied]
+        if denied.is_dir():
+            names.extend(
+                Path(directory, name) for directory, _, files in os.walk(denied, onerror=_uncheckable) for name in files
+            )
+        for name in names:
+            try:
+                status = name.lstat()
+            except OSError as exc:
+                _uncheckable(exc)
+                continue
+            if not stat.S_ISDIR(status.st_mode) and status.st_nlink > 1:
+                raise SandboxError(f"sandbox denied path has another hard link and cannot be enforced: {name}")
+
+
 def _check_scratch(scratch: Path, roots: tuple[SandboxRoot, ...]) -> None:
     """Fail unless ``scratch`` is a real path outside every root, and so outside every denied path.
 
@@ -584,6 +615,7 @@ class MacOSSandbox:
             tools=tuple(dict.fromkeys(profile.tools)),
             optional_tools=tuple(dict.fromkeys(profile.optional_tools)),
         )
+        _check_denied_paths(self.profile.denied_paths)
         self.timeout_seconds = timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.process_label = process_label
@@ -645,6 +677,8 @@ class MacOSSandbox:
     async def _execute(self, argv: list[str]) -> CommandResult:
         if not self._sandbox_exec.is_file():
             raise SandboxError("macOS sandbox-exec is unavailable")
+        # The host may have linked or replaced a denied path since the sandbox was created.
+        await asyncio.to_thread(_check_denied_paths, self.profile.denied_paths)
         # A private TMPDIR per command, removed afterward. libxcrun, behind the /usr/bin
         # shims, caches lookups in it.
         with tempfile.TemporaryDirectory(

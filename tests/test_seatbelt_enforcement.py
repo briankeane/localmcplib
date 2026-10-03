@@ -299,6 +299,48 @@ async def test_hard_link_to_denied_file_cannot_be_read(
     _assert_denied(result, leaked="denied-file-secret")
 
 
+@pytest.mark.parametrize("linked", [0, 1], ids=["denied-file", "file-in-denied-directory"])
+async def test_existing_hard_link_to_denied_file_fails_closed(
+    workspace: Workspace, denied_layout: tuple[Path, Path, Path], linked: int
+) -> None:
+    # Seatbelt denies paths, so a link the host made earlier would expose the file under its other name.
+    denied_file, nested, _ = denied_layout
+    profile = workspace.profile(denied_paths=(denied_file, nested.parent))
+    sandbox = MacOSSandbox(profile)
+    os.link(denied_layout[linked], workspace.read_only / "alias.txt")
+
+    with pytest.raises(SandboxError, match="another hard link"):
+        await sandbox.run(f"cat {workspace.read_only / 'alias.txt'}")
+    with pytest.raises(SandboxError, match="another hard link"):
+        MacOSSandbox(profile)
+
+
+async def test_hard_link_into_an_unreadable_denied_directory_fails_closed(
+    workspace: Workspace, denied_layout: tuple[Path, Path, Path]
+) -> None:
+    # The check cannot see this link, which would leave the file readable under its other name.
+    locked = denied_layout[1].parent / "locked"
+    locked.mkdir()
+    (locked / "key.txt").write_text("locked-secret")
+    os.link(locked / "key.txt", workspace.read_only / "alias.txt")
+    locked.chmod(0o000)
+    try:
+        with pytest.raises(SandboxError, match="cannot be checked for hard links"):
+            MacOSSandbox(workspace.profile(denied_paths=(locked.parent,)))
+    finally:
+        locked.chmod(0o755)
+
+
+async def test_denied_path_through_a_symlink_fails_closed(
+    workspace: Workspace, denied_layout: tuple[Path, Path, Path]
+) -> None:
+    # Seatbelt matches the real path a file is opened by, so denying the link's path would hide nothing.
+    (workspace.read_write / "link").symlink_to(denied_layout[1].parent)
+
+    with pytest.raises(SandboxError, match="goes through a symlink"):
+        MacOSSandbox(workspace.profile(denied_paths=(workspace.read_write / "link" / "key.txt",)))
+
+
 @pytest.mark.parametrize(
     ("command", "leaked"),
     [
