@@ -32,7 +32,13 @@ from localmcp.sandbox import (
     SandboxRoot,
     seatbelt,
 )
-from localmcp.sandbox.seatbelt import MacOSSandbox, _developer_directory, _homebrew_prefix, _homebrew_tool
+from localmcp.sandbox.seatbelt import (
+    MacOSSandbox,
+    _developer_directory,
+    _developer_installation,
+    _homebrew_prefix,
+    _homebrew_tool,
+)
 
 _SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 _SEATBELT_AVAILABLE = sys.platform == "darwin" and _SANDBOX_EXEC.is_file()
@@ -87,6 +93,14 @@ def workspace(tmp_path: Path) -> Workspace:
     for directory in (directories.read_write, directories.read_only, directories.outside):
         directory.mkdir()
     return directories
+
+
+@pytest.fixture
+def system_perl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hide Homebrew, whose perl would otherwise serve the profile's perl and perl scripts in place of /usr/bin/perl."""
+    if not Path(_PERL).is_file():
+        pytest.skip(f"{_PERL} unavailable")
+    monkeypatch.setattr(seatbelt, "_HOMEBREW_PREFIXES", ())
 
 
 async def _run(
@@ -615,6 +629,7 @@ async def test_programs_in_a_read_write_root_cannot_run(workspace: Workspace, co
     assert "Operation not permitted" in result.stderr
 
 
+@pytest.mark.usefixtures("system_perl")
 async def test_script_tools_run_their_interpreter_only_for_themselves(workspace: Workspace) -> None:
     shasum = Path("/usr/bin/shasum")
     if not shasum.is_file() or not shasum.read_bytes().startswith(b"#!/usr/bin/perl"):
@@ -858,6 +873,8 @@ async def test_shims_are_not_tools_without_a_developer_install(
 async def test_tools_run_toolchain_python_through_the_shim(workspace: Workspace, developer: Path) -> None:
     if not (developer / "usr" / "bin" / "python3").is_file():
         pytest.skip("selected developer directory has no python3")
+    if _developer_installation(developer) != developer:
+        pytest.skip("an Xcode.app shim cannot run in the sandbox")
 
     result = await _run(
         workspace.profile(tools=("python3",)),
@@ -869,6 +886,24 @@ async def test_tools_run_toolchain_python_through_the_shim(workspace: Workspace,
     assert result.stdout.strip() == "3"
     # The shim's libxcrun caches lookups in TMPDIR and reports when it cannot.
     assert "xcrun" not in result.stderr
+
+
+async def test_xcode_tools_run_by_name_but_not_through_the_shim(workspace: Workspace, developer: Path) -> None:
+    if not (developer / "usr" / "bin" / "python3").is_file():
+        pytest.skip("selected developer directory has no python3")
+    if _developer_installation(developer) == developer:
+        pytest.skip("selected developer directory is not inside an Xcode.app")
+
+    result = await _run(
+        workspace.profile(tools=("python3",)),
+        "python3 -c 'import json, sqlite3; print(json.dumps(sqlite3.sqlite_version_info[0]))'"
+        " && /usr/bin/python3 -c 'print(4)'",
+        timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
+    )
+
+    assert result.exit_code == 126, result
+    assert result.stdout == "3\n"
+    assert "/usr/bin/python3: Operation not permitted" in result.stderr
 
 
 def _granting_tools() -> tuple[str, ...]:
@@ -955,7 +990,7 @@ _BACKGROUND = "(sleep 1; touch late) >/dev/null 2>&1 & touch started"
 _SUPERVISION_TOOLS = ("perl", "seq", "sleep", "touch")
 
 
-@pytest.mark.skipif(not Path(_PERL).is_file(), reason="/usr/bin/perl unavailable")
+@pytest.mark.usefixtures("system_perl")
 @pytest.mark.parametrize(
     ("command", "timed_out"),
     [(_DETACHED, False), (_DETACHED + "; sleep 30", True), (_BACKGROUND, False)],
@@ -985,7 +1020,7 @@ async def test_supervision_spares_concurrent_commands_with_the_same_profile(work
     assert result.stdout == "survived\n"
 
 
-@pytest.mark.skipif(not Path(_PERL).is_file(), reason="/usr/bin/perl unavailable")
+@pytest.mark.usefixtures("system_perl")
 async def test_detached_fork_storm_is_stopped_at_the_timeout(workspace: Workspace) -> None:
     storm = (
         "for i in $(seq 1 40); do"
@@ -999,5 +1034,7 @@ async def test_detached_fork_storm_is_stopped_at_the_timeout(workspace: Workspac
     await asyncio.sleep(2.5)
 
     assert result.timed_out is True, result
+    # Otherwise perl never ran, and nothing could have written late.
+    assert "Operation not permitted" not in result.stderr, result
     assert elapsed < 10
     assert not (workspace.read_write / "late").exists()

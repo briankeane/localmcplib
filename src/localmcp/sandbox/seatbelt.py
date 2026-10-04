@@ -355,9 +355,10 @@ def _tool_grant(homebrew: Path | None, developer: Path | None, tool: str) -> _To
         return _runnable(_ToolGrants(kegs, links, (executable.parent,)), (executable,), _helpers(keg / "libexec", tool))
     directories = () if developer is None else _developer_bin_directories(developer)
     programs = tuple(filter(None, (_executable(tool, (directory,)) for directory in directories)))
-    if programs:
+    if developer is not None and programs:
         # The install keeps helper programs in libexec too, and the tool's shim runs it from the install.
-        shim = _executable(tool, (_SHIM_DIRECTORY,))
+        # An Xcode.app shim would first run xcodebuild, which is not granted, to check the license.
+        shim = _executable(tool, (_SHIM_DIRECTORY,)) if _developer_installation(developer) == developer else None
         helpers = tuple(helper for directory in directories for helper in _helpers(directory.parent / "libexec", tool))
         return _runnable(_ToolGrants(developer=developer), programs if shim is None else (*programs, shim), helpers)
     system = _executable(tool, _SYSTEM_BIN_DIRECTORIES)
@@ -373,11 +374,11 @@ def _tool_grants(tools: tuple[str, ...], optional_tools: tuple[str, ...] = ()) -
     """Resolve each tool to the installed code it runs from, and nothing more.
 
     A Homebrew formula's tool brings that formula and its runtime dependencies. A tool from
-    the selected Xcode or Command Line Tools install brings that install, which its
-    ``/usr/bin`` shim also runs. Homebrew wins, as on a default shell PATH, and base-system
-    tools need nothing but their own exec grant; a shim alone is not a base-system tool. The
-    caller's PATH and environment are never consulted. An optional tool that is missing or
-    broken is skipped and grants nothing.
+    the selected Xcode or Command Line Tools install brings that install, which a Command
+    Line Tools ``/usr/bin`` shim also runs. Homebrew wins, as on a default shell PATH, and
+    base-system tools need nothing but their own exec grant; a shim alone is not a
+    base-system tool. The caller's PATH and environment are never consulted. An optional
+    tool that is missing or broken is skipped and grants nothing.
     """
     if not tools and not optional_tools:
         return _ToolGrants()

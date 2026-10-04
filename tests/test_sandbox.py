@@ -1192,6 +1192,20 @@ def test_developer_tools_run_through_their_shims(monkeypatch: pytest.MonkeyPatch
     assert MacOSSandbox(SandboxProfile((SandboxRoot(root),), tools=("clang",)))._executable_trees == ()
 
 
+def test_xcode_tools_do_not_run_through_their_shims(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    developer = _fake_xcode(tmp_path, "clang")
+    (seatbelt._SHIM_DIRECTORY / "clang").touch(mode=0o755)
+    _use_toolchains(monkeypatch, homebrew=None, developer=developer)
+
+    sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(root),), tools=("clang",)))
+
+    # An Xcode.app shim first runs xcodebuild, which no tool brings, so it could only fail.
+    toolchain = developer / "Toolchains" / "XcodeDefault.xctoolchain" / "usr" / "bin"
+    assert sandbox._executables == (*_SHELL, toolchain / "clang")
+
+
 def test_toolchains_are_not_looked_up_without_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(seatbelt, "_developer_directory", lambda: pytest.fail("must not look up"))
     monkeypatch.setattr(seatbelt, "_homebrew_prefix", lambda: pytest.fail("must not look up"))

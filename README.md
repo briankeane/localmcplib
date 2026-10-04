@@ -244,7 +244,9 @@ and nothing else:
   unreadable, including other formulae and its `etc`, `share` and `var`.
 - A command provided by the system-selected Xcode or Command Line Tools install,
   such as `git`, `python3`, `clang` or `make`, brings that install and Xcode's
-  license record, and its `/usr/bin` shim may run too.
+  license record. Its `/usr/bin` shim may run too when the Command Line Tools are
+  selected, but not when Xcode is, because Xcode's shims run `xcodebuild` first.
+  Running the command by name finds the install's own copy either way.
 - A base-system command needs nothing more. A `/usr/bin` developer shim is not
   one, so a developer tool is not installed unless the selected install
   provides it. Any other command is an error when the sandbox is created.
