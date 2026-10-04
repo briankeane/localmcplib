@@ -381,6 +381,83 @@ async def test_paths_unrelated_to_denied_paths_can_be_renamed(
     assert result.stdout == "public-content"
 
 
+# Filesystem: read-only roots inside read-write roots
+
+
+@pytest.fixture
+def protected_profile(workspace: Workspace) -> SandboxProfile:
+    """Write-protect ``docs/_source`` inside the read-write root."""
+    protected = workspace.read_write / "docs" / "_source"
+    protected.mkdir(parents=True)
+    (protected / "source.md").write_text("original")
+    return SandboxProfile(
+        roots=(
+            SandboxRoot(workspace.read_write, RootAccess.READ_WRITE),
+            SandboxRoot(protected, RootAccess.READ_ONLY),
+        ),
+        tools=_TOOLS,
+    )
+
+
+async def test_write_protected_root_is_readable(protected_profile: SandboxProfile) -> None:
+    result = await _run(protected_profile, "cat docs/_source/source.md && ls docs/_source")
+
+    assert result.exit_code == 0, result
+    assert result.stdout == "originalsource.md\n"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("echo changed > docs/_source/source.md", id="overwrite"),
+        pytest.param("echo changed >> docs/_source/source.md", id="append"),
+        pytest.param("sed -i '' 's/original/changed/' docs/_source/source.md", id="sed-in-place"),
+        pytest.param("rm docs/_source/source.md", id="remove"),
+        pytest.param("mv docs/_source/source.md docs/moved.md", id="rename-file-out"),
+        pytest.param("mv docs/_source docs/moved", id="rename-protected-root"),
+        pytest.param("mv docs moved", id="rename-ancestor"),
+        pytest.param("touch docs/_source/new.md", id="create"),
+        pytest.param("mkdir docs/_source/new", id="create-directory"),
+        pytest.param("echo x > docs/new.md && mv docs/new.md docs/_source/source.md", id="rename-over"),
+        pytest.param("chmod 600 docs/_source/source.md", id="chmod"),
+        pytest.param("ln docs/_source/source.md docs/link.md && echo changed >> docs/link.md", id="hard-link"),
+        pytest.param("ln -s _source/source.md docs/link.md && echo changed >> docs/link.md", id="symlink"),
+        pytest.param("rm -rf docs", id="remove-ancestor-tree"),
+    ],
+)
+async def test_write_protected_root_cannot_be_changed(
+    workspace: Workspace, protected_profile: SandboxProfile, command: str
+) -> None:
+    result = await _run(protected_profile, command)
+
+    assert result.exit_code != 0, result
+    protected = workspace.read_write / "docs" / "_source"
+    assert sorted(path.name for path in protected.iterdir()) == ["source.md"]
+    assert (protected / "source.md").read_text() == "original"
+    assert (protected / "source.md").stat().st_nlink == 1
+
+
+async def test_rest_of_read_write_root_stays_writable(workspace: Workspace, protected_profile: SandboxProfile) -> None:
+    result = await _run(
+        protected_profile,
+        "cp docs/_source/source.md docs/copy.md && echo more >> docs/copy.md"
+        " && mkdir docs/guides && mv docs/copy.md docs/guides/",
+    )
+
+    assert result.exit_code == 0, result
+    assert (workspace.read_write / "docs" / "guides" / "copy.md").read_text() == "originalmore\n"
+
+
+async def test_hard_link_added_to_write_protected_file_by_host_fails_closed(
+    workspace: Workspace, protected_profile: SandboxProfile
+) -> None:
+    sandbox = MacOSSandbox(protected_profile)
+    os.link(workspace.read_write / "docs" / "_source" / "source.md", workspace.outside / "alias.md")
+
+    with pytest.raises(SandboxError, match="read-only root has another hard link"):
+        await sandbox.run("true")
+
+
 # Network
 
 

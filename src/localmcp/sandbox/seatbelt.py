@@ -88,14 +88,13 @@ def _validated_roots(roots: tuple[SandboxRoot, ...]) -> tuple[SandboxRoot, ...]:
         by_path[path] = root.access
         resolved.append(SandboxRoot(path, root.access))
 
-    for ancestor in resolved:
-        if ancestor.access != RootAccess.READ_WRITE:
-            continue
-        for descendant in resolved:
-            if descendant.access == RootAccess.READ_ONLY and descendant.path.is_relative_to(ancestor.path):
-                raise SandboxError(
-                    f"read-only root is contained by a read-write root and cannot be enforced: {descendant.path}"
-                )
+    # A read-only root inside a read-write root is write-protected there; a read-write
+    # root inside that protected tree could not be granted, and normalizing below would
+    # silently fold it into the outer read-write root.
+    for protected in _protected_roots(tuple(resolved)):
+        for root in resolved:
+            if root.access == RootAccess.READ_WRITE and root.path.is_relative_to(protected):
+                raise SandboxError(f"read-write root is inside a write-protected read-only root: {root.path}")
 
     normalized: list[SandboxRoot] = []
     for index, root in enumerate(resolved):
@@ -429,34 +428,46 @@ def _tool_grants(tools: tuple[str, ...], optional_tools: tuple[str, ...] = ()) -
     )
 
 
-def _uncheckable(error: OSError) -> None:
-    """Fail on an error checking a denied path, unless its file is gone and so has no other name."""
-    if not isinstance(error, FileNotFoundError):
-        raise SandboxError(f"sandbox denied path cannot be checked for hard links: {error.filename}") from error
-
-
-def _check_denied_paths(denied_paths: tuple[Path, ...]) -> None:
-    """Fail unless Seatbelt can deny each denied path's files under every name.
+def _check_denied_paths(denied_paths: tuple[Path, ...], kind: str = "denied path") -> None:
+    """Fail unless Seatbelt can deny access to each path's files under every name.
 
     Seatbelt denies the real path a file is opened by. A denied path through a symlink
-    denies nothing, and a denied file with another hard link stays readable under that name.
+    denies nothing, and a denied file with another hard link stays accessible under that
+    name. ``kind`` names the paths in errors: denied paths are hidden, and write-protected
+    read-only roots are checked the same way.
     """
+
+    def uncheckable(error: OSError) -> None:
+        # A file that is gone has no other name.
+        if not isinstance(error, FileNotFoundError):
+            raise SandboxError(f"sandbox {kind} cannot be checked for hard links: {error.filename}") from error
+
     for denied in denied_paths:
         if Path(os.path.realpath(denied)) != denied:
-            raise SandboxError(f"sandbox denied path goes through a symlink and cannot be enforced: {denied}")
+            raise SandboxError(f"sandbox {kind} goes through a symlink and cannot be enforced: {denied}")
         names = [denied]
         if denied.is_dir():
             names.extend(
-                Path(directory, name) for directory, _, files in os.walk(denied, onerror=_uncheckable) for name in files
+                Path(directory, name) for directory, _, files in os.walk(denied, onerror=uncheckable) for name in files
             )
         for name in names:
             try:
                 status = name.lstat()
             except OSError as exc:
-                _uncheckable(exc)
+                uncheckable(exc)
                 continue
             if not stat.S_ISDIR(status.st_mode) and status.st_nlink > 1:
-                raise SandboxError(f"sandbox denied path has another hard link and cannot be enforced: {name}")
+                raise SandboxError(f"sandbox {kind} has another hard link and cannot be enforced: {name}")
+
+
+def _protected_roots(roots: tuple[SandboxRoot, ...]) -> tuple[Path, ...]:
+    """Return the read-only roots that lie inside a read-write root, which must be write-protected."""
+    return tuple(
+        root.path
+        for root in roots
+        if root.access == RootAccess.READ_ONLY
+        and any(other.access == RootAccess.READ_WRITE and root.path.is_relative_to(other.path) for other in roots)
+    )
 
 
 def _check_scratch(scratch: Path, roots: tuple[SandboxRoot, ...]) -> None:
@@ -620,6 +631,8 @@ class MacOSSandbox:
             optional_tools=tuple(dict.fromkeys(profile.optional_tools)),
         )
         _check_denied_paths(self.profile.denied_paths)
+        self._protected_paths = _protected_roots(self.roots)
+        _check_denied_paths(self._protected_paths, "read-only root")
         self.timeout_seconds = timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.process_label = process_label
@@ -649,11 +662,11 @@ class MacOSSandbox:
         self._metadata_ancestors = tuple(
             sorted({*_path_ancestors((*granted, self._scratch_parent)), self._scratch_parent}, key=os.fspath)
         )
-        # Renaming a denied path, or any directory above it inside a root,
-        # would move its contents out from under the read denial.
+        # Renaming a denied or write-protected path, or any directory above it inside a
+        # root, would move its contents out from under the denial.
         self._denied_ancestors = tuple(
             ancestor
-            for ancestor in _path_ancestors(self.profile.denied_paths)
+            for ancestor in _path_ancestors((*self.profile.denied_paths, *self._protected_paths))
             if any(ancestor.is_relative_to(root.path) for root in self.roots)
         )
 
@@ -683,6 +696,7 @@ class MacOSSandbox:
             raise SandboxError("macOS sandbox-exec is unavailable")
         # The host may have linked or replaced a denied path since the sandbox was created.
         await asyncio.to_thread(_check_denied_paths, self.profile.denied_paths)
+        await asyncio.to_thread(_check_denied_paths, self._protected_paths, "read-only root")
         # A private TMPDIR per command, removed afterward. libxcrun, behind the /usr/bin
         # shims, caches lookups in it.
         with tempfile.TemporaryDirectory(
@@ -720,6 +734,9 @@ class MacOSSandbox:
             for index, path in enumerate(self.profile.denied_paths)
             for value in ("-D", f"DENIED_PATH_{index}={path}")
         ]
+        denied_path_definitions.extend(
+            value for index, path in enumerate(self._protected_paths) for value in ("-D", f"PROTECTED_{index}={path}")
+        )
         denied_path_definitions.extend(
             value
             for index, path in enumerate(self._denied_ancestors)
@@ -818,6 +835,11 @@ class MacOSSandbox:
         runtime_profile += "".join(
             f'(deny file-read* (literal (param "DENIED_PATH_{index}")) (subpath (param "DENIED_PATH_{index}")))\n'
             for index in range(len(self.profile.denied_paths))
+        )
+        # A read-only root inside a read-write root stays readable but nothing in it can be
+        # written, created, renamed, removed, or hard-linked to a new name.
+        runtime_profile += "".join(
+            f'(deny file-write* (subpath (param "PROTECTED_{index}")))\n' for index in range(len(self._protected_paths))
         )
         runtime_profile += "".join(
             f'(deny file-write-unlink (literal (param "DENIED_PATH_{index}")) '

@@ -169,6 +169,15 @@ The sandbox refuses to be created, or to run a command, while a denied path
 breaks either rule or cannot be checked, such as when it holds a directory the
 caller cannot list.
 
+A read-only root may sit inside a read-write root to write-protect part of it,
+such as `SandboxRoot(worktree / "_source", RootAccess.READ_ONLY)` next to
+`SandboxRoot(worktree, RootAccess.READ_WRITE)`. Commands can read the protected
+tree but cannot write, create, rename, remove or chmod anything in it, link its
+files to a new name, or rename the directories above it inside the read-write
+root. A protected file must have no other hard link, whose name would stay
+writable, and no read-write root may lie inside a protected one; the sandbox
+refuses to be created or to run a command otherwise.
+
 A profile's `tools` are the complete list of commands its commands may run
 besides shell builtins; anything else fails with "Operation not permitted",
 including when a listed tool such as `awk`, `find` or `xargs` tries to run it,

@@ -83,16 +83,52 @@ class _Budget:
         return {"scope": exhausted_scope or "available"}
 
 
-def test_profile_rejects_read_only_root_nested_in_writable_root(tmp_path: Path) -> None:
+def test_profile_write_protects_read_only_root_nested_in_writable_root(tmp_path: Path) -> None:
     nested = tmp_path / "nested"
     nested.mkdir()
 
-    with pytest.raises(SandboxError, match="cannot be enforced"):
+    sandbox = MacOSSandbox(
+        SandboxProfile(
+            (
+                SandboxRoot(tmp_path, RootAccess.READ_WRITE),
+                SandboxRoot(nested, RootAccess.READ_ONLY),
+            )
+        )
+    )
+
+    assert '(deny file-write* (subpath (param "PROTECTED_0")))' in sandbox._compiled_profile()
+
+
+def test_profile_rejects_writable_root_inside_write_protected_root(tmp_path: Path) -> None:
+    protected = tmp_path / "protected"
+    inner = protected / "inner"
+    inner.mkdir(parents=True)
+
+    with pytest.raises(SandboxError, match=re.escape(f"inside a write-protected read-only root: {inner}")):
         MacOSSandbox(
             SandboxProfile(
                 (
                     SandboxRoot(tmp_path, RootAccess.READ_WRITE),
-                    SandboxRoot(nested, RootAccess.READ_ONLY),
+                    SandboxRoot(protected, RootAccess.READ_ONLY),
+                    SandboxRoot(inner, RootAccess.READ_WRITE),
+                )
+            )
+        )
+
+
+def test_profile_rejects_write_protected_file_with_another_hard_link(tmp_path: Path) -> None:
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    (protected / "source.md").write_text("source")
+    other = tmp_path / "other.md"
+    os.link(protected / "source.md", other)
+
+    with pytest.raises(SandboxError, match="read-only root has another hard link and cannot be enforced"):
+        MacOSSandbox(
+            SandboxProfile(
+                (
+                    SandboxRoot(tmp_path, RootAccess.READ_WRITE),
+                    SandboxRoot(protected, RootAccess.READ_ONLY),
                 )
             )
         )
