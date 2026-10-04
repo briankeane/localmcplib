@@ -137,15 +137,62 @@ works across tool-capable models: it registers an ordinary, unforced
 and plain-text answers to the model for correction, and raises
 `SubmitResultError` after `max_attempts` (default 5) failed attempts in a run.
 Tool calls whose arguments cannot be parsed are answered with an error rather
-than replayed to the provider verbatim:
+than replayed to the provider verbatim.
+
+The unforced tool and its correction loop are a deliberate cross-model
+requirement, not a naive retry. Forcing the call with `tool_choice` is the
+obvious way to guarantee a structured result, but it is not universally
+supported: some models reject a forced `tool_choice` outright, and some
+gateways ignore a native `json_schema` response format and return plain text.
+An ordinary tool that the model chooses to call is the lowest common
+denominator that every tool-capable model and gateway accepts. Because nothing
+forces that call, a model can occasionally answer in prose or submit invalid
+arguments; the bounded correction loop is what makes that portable mechanism
+dependable.
+
+The loop also absorbs differences in response shape. Models that miss the
+schema do so in different ways: JSON in a Markdown fence or wrapped in prose,
+arguments that are not valid JSON, or fields of the wrong type. Rather than
+keep a model-specific recovery parser for each shape, the middleware never
+salvages text output. It tells the model exactly what was wrong and asks it to
+submit again, so one correction path covers every model.
+
+Do not replace this with a forced `tool_choice` or a provider-native schema
+unless every model an application can be configured with supports it:
 
 ```python
 agent = create_agent(model, tools, middleware=[SubmitResultMiddleware(Answer)])
 answer = (await agent.ainvoke({"messages": [("user", "...")]}))["structured_response"]
 ```
 
-For `ProviderStrategy` agents, `FencedJSONOutputMiddleware` accepts a response
-wrapped in one Markdown JSON fence, still validated against the same schema.
+For a single structured result without other tools, `submit_structured`
+replaces `with_structured_output`, whose `function_calling` method forces
+`tool_choice` and whose `json_schema` method relies on a native constraint:
+
+```python
+answer = await submit_structured(model, Answer, system_prompt="...", messages=[HumanMessage("...")])
+```
+
+`localmcp.retry.ModelCallRetryMiddleware` retries a single failed model call
+on rate limits, 5xx responses, and connection faults, so a transient error does
+not restart an agent run or replay its tool calls. It is independent of the
+correction loop: it repeats an identical request after a transport fault and
+never re-prompts, while the correction loop re-prompts after a model's answer
+and never retries transport errors. It also handles both OpenAI and Anthropic
+SDK errors and gateway-specific rate-limit messages, so one policy applies
+whichever model and route an application is configured with. Rate limits wait for
+`Retry-After` or for a reset instant embedded in the error message; other
+errors use capped, jittered exponential backoff. Deterministic errors propagate
+immediately. `submit_structured` includes it by default. Place it after
+`SubmitResultMiddleware` so it wraps the model call directly:
+
+```python
+middleware = [SubmitResultMiddleware(Answer), ModelCallRetryMiddleware(max_attempts=3)]
+```
+
+`call_with_rate_limit_retry`, `is_retryable_error`, and `rate_limit_delay`
+apply the same policy to other awaitables. The SDK clients' own retries still
+apply beneath these layers.
 
 ### Sandboxing
 
