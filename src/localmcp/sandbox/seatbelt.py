@@ -705,6 +705,8 @@ class MacOSSandbox:
         ) as directory:
             scratch = Path(directory)
             _check_scratch(scratch, self.roots)
+            # Supervision is first needed only after the command finishes; without it, nothing may run.
+            _libsystem()
             (scratch / _SCRATCH_SENTINEL).touch()
             try:
                 return await self._execute_with_scratch(argv, scratch)

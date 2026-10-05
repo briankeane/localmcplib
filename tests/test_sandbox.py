@@ -485,10 +485,33 @@ async def _prepare_execute(
         captured["swept"].append(scratch)
 
     monkeypatch.setattr(seatbelt, "_terminate_command_processes", sweep)
+    monkeypatch.setattr(seatbelt, "_libsystem", lambda: None)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
     monkeypatch.setattr(sandbox, "_read_output", read_output)
     return sandbox, process, captured
+
+
+@pytest.mark.asyncio
+async def test_execute_runs_nothing_without_process_supervision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def read_output(process: _Process, stdout: bytearray, stderr: bytearray) -> None:
+        pytest.fail("must not run")
+
+    sandbox, _process, captured = await _prepare_execute(monkeypatch, tmp_path, read_output)
+
+    def unavailable() -> None:
+        raise SandboxError("macOS process supervision is unavailable")
+
+    monkeypatch.setattr(seatbelt, "_libsystem", unavailable)
+
+    with pytest.raises(SandboxError, match="process supervision is unavailable"):
+        await sandbox._execute(["/bin/sh", "-c", "touch ran"])
+    # The command never started, so there was nothing to sweep, and its scratch is gone.
+    assert "argv" not in captured
+    assert captured["swept"] == []
+    assert not any(sandbox._scratch_parent.iterdir())
 
 
 @pytest.mark.asyncio
